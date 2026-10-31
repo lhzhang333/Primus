@@ -71,6 +71,9 @@ export PROFILE=${PROFILE:-False}
 # 1: bind each rank's CPU threads and host memory to the NUMA node of its GPU (0.6% faster on 4 GPUs,
 # with even and with spread routing alike)
 export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}
+# 4 hardware queues, not base_env.sh's 2: 0.2% faster on 4 GPUs, and MegaMoE's deferred gradient checks
+# (megatron.rerun.deferred_nan_check) need them at EP > 1, or they keep one sync per bucket group
+export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-4}
 # 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
 export PATCH_TRITON_EXPERT_SCHEDULING=${PATCH_TRITON_EXPERT_SCHEDULING:-1}
 # hipBLASLt kernels tuned for this example's GEMMs (README.md); empty: hipBLASLt's own choice. hipBLASLt
