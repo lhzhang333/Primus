@@ -34,8 +34,11 @@ What makes the skip safe:
   producer selects and logs the beta=0 writer in actual backward order, so
   activation recompute and staged forwards cannot leave a forward-time claim.
 - An empty log means "zero everything". Iteration 0 has nothing logged, as do
-  configurations where no overwrite-capable producer runs. The previous log
-  is also discarded unless the current schedule has exactly one microbatch.
+  configurations where no overwrite-capable producer runs. With more than one
+  microbatch, only first-write claims are kept: slices whose producer (the
+  Mega MoE wgrad) overwrites on the iteration's first write and accumulates on
+  the later ones (``grad_ownership.claim_first_write``). The MXFP4 producer
+  overwrites on every call, so its claims hold only for one-microbatch steps.
 - CUDA-graph configurations do not install this consumer: Python ownership
   recording is not replayed with captured backward kernels.
 - A claim is honoured only when the parameter's ``main_grad`` is exactly the
@@ -73,16 +76,22 @@ _POISON = os.environ.get("PRIMUS_TURBO_GRAD_OWNERSHIP_POISON", "0") == "1"
 _state: dict[str, object] = {"owned": frozenset(), "seen": set(), "logged": False}
 
 
-def _rotate_ownership(grad_ownership, *, discard: bool) -> frozenset[Slice]:
+def _rotate_ownership(grad_ownership, *, discard: bool, keep_first_writes: bool = False) -> frozenset[Slice]:
     """Start a producer epoch, optionally discarding the completed epoch.
 
     Pipeline warmup runs with ``args.curr_iteration == -1``. Its beta=0 writes
     exercise kernels but must never authorize skipped clearing in iteration 0.
     Rotating and discarding here clears the producer log without carrying those
-    synthetic writes into real training.
+    synthetic writes into real training. ``keep_first_writes`` keeps, out of a
+    discarded epoch, the slices claimed by first-write producers.
     """
     owned = grad_ownership.begin_step()
-    return frozenset() if discard else owned
+    if not discard:
+        return owned
+    previous_first_writes = getattr(grad_ownership, "previous_first_writes", None)
+    if keep_first_writes and previous_first_writes is not None:
+        return frozenset(previous_first_writes())
+    return frozenset()
 
 
 def _get_num_microbatches() -> int:
@@ -102,6 +111,18 @@ def _discard_ownership_for_step(args) -> bool:
         # If the calculator is unavailable or not initialized, ownership for
         # the current schedule is not proven. Fail closed with a full clear.
         return True
+
+
+def _keep_first_writes_for_step(args) -> bool:
+    """Whether this step may trust first-write claims: a real iteration with a known schedule,
+    whatever its number of microbatches."""
+    if getattr(args, "curr_iteration", None) == -1:
+        return False
+    try:
+        _get_num_microbatches()
+    except Exception:  # noqa: BLE001 -- any uncertainty must fail closed.
+        return False
+    return True
 
 
 def _is_enabled(ctx: PatchContext) -> bool:
@@ -263,6 +284,7 @@ def patch_grad_buffer_ownership(ctx: PatchContext) -> None:
             _state["owned"] = _rotate_ownership(
                 grad_ownership,
                 discard=_discard_ownership_for_step(args),
+                keep_first_writes=_keep_first_writes_for_step(args),
             )
             seen.clear()
         seen.add(id(self))
