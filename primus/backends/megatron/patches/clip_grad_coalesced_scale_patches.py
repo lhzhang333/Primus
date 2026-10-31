@@ -18,6 +18,11 @@ pass that reads the coefficient from the device: the same fp32 product, rounded 
 multi-tensor kernel, so the clipped gradients are bit for bit the same. Gradients that overlap or
 are not contiguous, a host (float) coefficient and a build without TE's tensor kernel keep the
 upstream function.
+
+When every parameter belongs to an optimizer that folds the coefficient into its Adam step
+(``deferred_clip``, the Triton param-remainder Adam), the gradients are not scaled here at all: the
+coefficient is left on the parameters and the step applies it as it reads each gradient, to the
+same value.
 """
 
 import collections
@@ -26,6 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
+from primus.backends.megatron.core.optimizer import deferred_clip
 from primus.core.patches import PatchContext, register_patch
 from primus.core.utils.module_utils import log_rank_0
 
@@ -100,22 +106,26 @@ def _make_clip(original):
         if not isinstance(total_norm, torch.Tensor) or clip_grads.multi_tensor_scale_tensor_impl is None:
             return original(parameters, max_norm, total_norm, use_decoupled_grad)
         # upstream's gradient selection
-        grads = []
+        grads, with_grad = [], []
         for param in parameters:
             if use_decoupled_grad:
                 if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
                     assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
                     grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
+                    with_grad.append(param)
             else:
                 if param.grad is not None:
                     assert param.grad.type() == "torch.cuda.FloatTensor"
                     grads.append(to_local_if_dtensor(param.grad).detach())
-        runs = contiguous_runs(grads)
-        if runs is None or any(r.device != total_norm.device for r in runs):
-            return original(parameters, max_norm, total_norm, use_decoupled_grad)
+                    with_grad.append(param)
         clip_coeff = max_norm / (total_norm + 1.0e-6)
         clip_coeff.clamp_max_(1.0)
         clip_coeff = clip_coeff.to(torch.float32).reshape(-1)[:1]
+        if deferred_clip.defer(with_grad, clip_coeff):
+            return
+        runs = contiguous_runs(grads)
+        if runs is None or any(r.device != total_norm.device for r in runs):
+            return original(parameters, max_norm, total_norm, use_decoupled_grad)
         for run in runs:
             scale_by_device_scalar(run, clip_coeff)
 
