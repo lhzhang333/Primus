@@ -74,6 +74,9 @@ export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}
 # 4 hardware queues, not base_env.sh's 2: 0.2% faster on 4 GPUs, and MegaMoE's deferred gradient checks
 # (megatron.rerun.deferred_nan_check) need them at EP > 1, or they keep one sync per bucket group
 export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-4}
+# 1: fold the residual adds into the RMSNorms, and the MoE layer's routed + shared add and its input-gradient
+# adds into the norms around it (fused_residual_rmsnorm.py, MoE mode); bit for bit the unfused layers
+export PRIMUS_FUSED_RESIDUAL_NORM_MOE=${PRIMUS_FUSED_RESIDUAL_NORM_MOE:-1}
 # 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
 export PATCH_TRITON_EXPERT_SCHEDULING=${PATCH_TRITON_EXPERT_SCHEDULING:-1}
 # hipBLASLt kernels tuned for this example's GEMMs (README.md); empty: hipBLASLt's own choice. hipBLASLt
