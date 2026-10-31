@@ -26,6 +26,7 @@ routing weight. Both flavours take them; the ops own how each is applied.
 import contextlib
 import functools
 import inspect
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -54,6 +55,13 @@ from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (
 )
 
 from primus.core.utils.module_utils import log_rank_0
+
+try:  # a Primus-Turbo without the prologue prefetch runs the shared expert after the routed experts
+    from primus_turbo.pytorch.ops.moe.fused_mega_moe import (
+        prefetch_fused_mega_moe_dispatch,
+    )
+except ImportError:
+    prefetch_fused_mega_moe_dispatch = None
 
 # Megatron's quick_gelu hardcodes its sigmoid scale.
 _QUICK_GELU_ALPHA = 1.702
@@ -284,6 +292,17 @@ class MegaMoEExperts(MegatronModule):
                 for expert_weight in weight.data:
                     init_method(expert_weight)
 
+    def prefetch_dispatch(self, x, topk_idx, topk_weights) -> bool:
+        """Issue the dispatch prologue of the next ``forward``, which must get these same tensors and
+        come next: work queued in between runs while that forward waits for the prologue's row count
+        and launches the dispatch. Returns False where Primus-Turbo has no such prefetch (gfx1250 only)."""
+        if prefetch_fused_mega_moe_dispatch is None or os.environ.get("PRIMUS_MEGA_PREFETCH_DISPATCH") == "0":
+            return False
+        # the weight's shape only: calling fc1_weight here would run its hooks out of order
+        return prefetch_fused_mega_moe_dispatch(
+            x, topk_idx, topk_weights, self.fc1_weight.weight, self.ep_group
+        )
+
     def forward(self, x, topk_idx, topk_weights):
         # only passed when set, so a Primus-Turbo without the argument still runs
         accum = {"fuse_wgrad_accum_pattern": self.wgrad_accum_pattern} if self.wgrad_accum_pattern else {}
@@ -318,6 +337,9 @@ class MegaMoEFP8Experts(MegaMoEExperts):
     The fp8 stages thread an extra opaque ``state`` from stage1 to stage2, which carries the
     quantized operands that cannot ride autograd's gradient slots.
     """
+
+    def prefetch_dispatch(self, x, topk_idx, topk_weights) -> bool:
+        return False  # the fp8 stages run a prologue of their own
 
     # The mxfp8 weight-quant cache is dropped by the megatron.turbo.mega_moe_weight_generation
     # patch, which advances the generation once per optimizer step. Doing it there rather than
@@ -519,18 +541,25 @@ class PrimusTurboMegaMoELayer(MegatronModule):
         topk_weights, topk_idx = probs.topk(self.router.topk, dim=-1)
 
         x = hidden_states.reshape(-1, self.hidden_size).to(torch.bfloat16)
-        y = self.experts(
-            x,
-            topk_idx,
-            topk_weights.to(torch.float32),
+        topk_weights = topk_weights.to(torch.float32)
+        # Without the side stream the shared expert, which needs no routing, goes between the dispatch
+        # prologue and the dispatch: it runs while the host waits for the prologue's row count and
+        # launches the dispatch, where the GPU would idle. The gradients are summed in the same order.
+        shared_first = (
+            side is None
+            and self.shared_experts is not None
+            and self.experts.prefetch_dispatch(x, topk_idx, topk_weights)
         )
+        if shared_first:
+            shared_out = self.shared_experts(hidden_states)
+        y = self.experts(x, topk_idx, topk_weights)
         y = y.reshape(in_shape).to(hidden_states.dtype)
         if side is not None:
             main.wait_stream(side)
             shared_out.record_stream(main)
             y = y + _RecordStreamInBackward.apply(shared_out, side)
         elif self.shared_experts is not None:
-            y = y + self.shared_experts(hidden_states)
+            y = y + (shared_out if shared_first else self.shared_experts(hidden_states))
         return y, None
 
     def sharded_state_dict(
