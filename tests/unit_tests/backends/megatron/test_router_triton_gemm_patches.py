@@ -114,6 +114,33 @@ def test_gfx1250_launch_configs_are_bit_identical(tokens, experts):
     assert torch.equal(router_triton._dx(dy, w), dx)
 
 
+@pytest.mark.parametrize("experts", [32, 128, 256])
+@pytest.mark.parametrize("tokens", [8192, 1000])
+def test_gfx1250_split_backward_is_bit_identical(tokens, experts):
+    hidden = 7168
+    x, w, dy = _inputs(tokens, hidden, experts)
+    if not router_triton._gfx1250(x):
+        pytest.skip("the gfx1250 pre-split backward")
+    assert router_triton._split_backward(dy)
+    dy[::7] *= 1e-6  # small dlogits too, so the lo half carries bits
+    hi, lo = router_triton._split(dy)
+    assert torch.equal(hi, dy.to(torch.bfloat16))
+    assert torch.equal(lo, (dy - hi.float()).to(torch.bfloat16))
+    dx = router_triton._dx(dy, w)
+    assert torch.equal(router_triton._dx_split(hi, lo, w), dx)
+    assert torch.equal(router_triton._dw_split(hi, lo, x), router_triton._dw(dy, x))
+    # router_dx_into: the same bits as autograd's sum of the two bf16 gradients
+    other = torch.randn(tokens, hidden, device="cuda").to(torch.bfloat16)
+    expected = other + dx
+    assert torch.equal(router_triton.router_dx_into(dy, w, other), expected)
+
+
+def test_router_dx_into_checks_its_output():
+    x, w, dy = _inputs(64, 7168, 32)
+    with pytest.raises(AssertionError):
+        router_triton.router_dx_into(dy, w, torch.zeros(64, 7168, device="cuda"))  # FP32 output
+
+
 def test_unsupported_shapes_are_rejected():
     x, w, _ = _inputs(64, 7168, 96)
     assert not router_triton._supported(x, w, None, torch.float32)  # not a power of two

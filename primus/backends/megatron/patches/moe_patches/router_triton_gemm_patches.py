@@ -21,6 +21,11 @@ Router dtype FP32 with BF16 input and weight, no bias, and shapes the kernels ti
 else keeps Megatron's path. Measured on MI455X for [8192 x 7168] x [7168 x 128]: fwd 346 -> 56 us,
 dX 282 -> 84 us, dW 324 -> 100 us per call; with the gfx1250 launch configs below, fwd 58 -> 25 us and
 dX 76 -> 69 us, bit-identical.
+
+On gfx1250 the backward forms the hi + lo pair once, in a small kernel both GEMMs read, instead of in
+every workgroup of each: at 128 experts dW 100 -> 57 us (a three-stage k-loop now pays off) and dX
+72 -> 69 us per call, the split included, bit-identical. ``router_dx_into`` adds dX
+into an existing gradient the way autograd would sum the two.
 """
 
 import functools
@@ -75,6 +80,26 @@ def _dx_launch(n: int, gfx1250: bool):
 
 def _dw_config(num_experts: int):
     return (32, 64, 4, 4) if num_experts >= 128 else (64, 64, 4, 8)
+
+
+# gfx1250 backward on a pre-split hi + lo pair (``_split``). The row block and the split count of dW stay
+# those of ``_dw_config``: they fix each output's summation order. Measured at 8192 x 7168, the split
+# (10 us) included in both: dW (BLOCK_H 64, 3 stages) 100 -> 57 us at 128 experts, 31 -> 29 us at 32,
+# 128 -> 88 us at 256 (4 warps there, 8 below); dX (256-wide, 8 warps) 72 -> 69 us at 128, flat at 32,
+# 122 -> 99 us at 256.
+_SPLIT_MAX_EXPERTS = 256
+_SPLIT_BLOCK = 4096
+_DX_SPLIT_LAUNCH = (128, 256, {"num_warps": 8, "num_stages": 1})
+_DW_SPLIT_BLOCK_H, _DW_SPLIT_STAGES = 64, 3
+
+
+def _dw_split_warps(num_experts: int) -> int:
+    return 4 if num_experts >= 256 else 8
+
+
+def _split_backward(g: torch.Tensor) -> bool:
+    """Whether the backward for dlogits ``g`` runs the pre-split kernels."""
+    return g.shape[1] <= _SPLIT_MAX_EXPERTS and _gfx1250(g)
 
 
 @triton.jit
@@ -133,6 +158,87 @@ def _router_dw_kernel(
         g_hi = g.to(tl.bfloat16)
         acc += tl.dot(g_hi, x)
         acc += tl.dot((g - g_hi.to(tl.float32)).to(tl.bfloat16), x)
+    tl.store(P + pid_s * sps + rn[:, None] * spn + rh[None, :], acc)
+
+
+@triton.jit
+def _router_split_kernel(G, HI, LO, numel, BLOCK: tl.constexpr):
+    """HI, LO (bf16) = the hi + lo pair of G (fp32), formed as the kernels above form it."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    g = tl.load(G + offs, mask=mask)
+    hi = g.to(tl.bfloat16)
+    tl.store(HI + offs, hi, mask=mask)
+    tl.store(LO + offs, (g - hi.to(tl.float32)).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _router_dx_split_kernel(
+    GH,
+    GL,
+    W,
+    DX,
+    M,
+    sgm,
+    swn,
+    sdm,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
+):
+    """DX[M, H] (bf16) = (GH + GL)[M, N] @ W[N, H]; ACCUMULATE: DX += that, rounded as autograd's sum
+    of two bf16 gradients (each rounded, added in fp32, rounded again)."""
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rh = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    rn = tl.arange(0, N)
+    mmask = rm < M
+    gh = tl.load(GH + rm[:, None] * sgm + rn[None, :], mask=mmask[:, None], other=0.0)
+    gl = tl.load(GL + rm[:, None] * sgm + rn[None, :], mask=mmask[:, None], other=0.0)
+    w = tl.load(W + rn[:, None] * swn + rh[None, :])
+    acc = tl.dot(gh, w)
+    acc += tl.dot(gl, w)
+    out = acc.to(tl.bfloat16)
+    ptrs = DX + rm[:, None] * sdm + rh[None, :]
+    if ACCUMULATE:
+        out = (out.to(tl.float32) + tl.load(ptrs, mask=mmask[:, None]).to(tl.float32)).to(tl.bfloat16)
+    tl.store(ptrs, out, mask=mmask[:, None])
+
+
+@triton.jit
+def _router_dw_split_kernel(
+    GH,
+    GL,
+    X,
+    P,
+    M,
+    sgm,
+    sxm,
+    sps,
+    spn,
+    N: tl.constexpr,
+    M_PER_SPLIT,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """P[s, N, H] (fp32) = (GH + GL)[rows of split s, N]^T @ X[rows of split s, H], the products summed
+    in the order of ``_router_dw_kernel``."""
+    pid_h = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    rn = tl.arange(0, N)
+    rh = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    acc = tl.zeros((N, BLOCK_H), dtype=tl.float32)
+    m_start = pid_s * M_PER_SPLIT
+    for m0 in range(m_start, m_start + M_PER_SPLIT, BLOCK_M):
+        rm = m0 + tl.arange(0, BLOCK_M)
+        mmask = rm < M
+        gh = tl.load(GH + rm[None, :] * sgm + rn[:, None], mask=mmask[None, :], other=0.0)
+        gl = tl.load(GL + rm[None, :] * sgm + rn[:, None], mask=mmask[None, :], other=0.0)
+        x = tl.load(X + rm[:, None] * sxm + rh[None, :], mask=mmask[:, None], other=0.0)
+        acc += tl.dot(gh, x)
+        acc += tl.dot(gl, x)
     tl.store(P + pid_s * sps + rn[:, None] * spn + rh[None, :], acc)
 
 
@@ -228,6 +334,80 @@ def _dw(g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return p.sum(0)
 
 
+def _split(g: torch.Tensor):
+    hi = torch.empty(g.shape, dtype=torch.bfloat16, device=g.device)
+    lo = torch.empty_like(hi)
+    _router_split_kernel[(triton.cdiv(g.numel(), _SPLIT_BLOCK),)](g, hi, lo, g.numel(), BLOCK=_SPLIT_BLOCK)
+    return hi, lo
+
+
+def _dx_split(hi: torch.Tensor, lo: torch.Tensor, w: torch.Tensor, out=None) -> torch.Tensor:
+    accumulate = out is not None
+    if out is None:
+        out = torch.empty(hi.shape[0], w.shape[1], dtype=torch.bfloat16, device=hi.device)
+    block_m, block_h, launch = _DX_SPLIT_LAUNCH
+    _router_dx_split_kernel[(triton.cdiv(hi.shape[0], block_m), w.shape[1] // block_h)](
+        hi,
+        lo,
+        w,
+        out,
+        hi.shape[0],
+        hi.stride(0),
+        w.stride(0),
+        out.stride(0),
+        N=w.shape[0],
+        BLOCK_M=block_m,
+        BLOCK_H=block_h,
+        ACCUMULATE=accumulate,
+        **launch,
+    )
+    return out
+
+
+def _dw_split(hi: torch.Tensor, lo: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    m = hi.shape[0]
+    block_m, _, splits, _ = _dw_config(hi.shape[1])
+    per = triton.cdiv(triton.cdiv(m, splits), block_m) * block_m
+    p = torch.empty(splits, hi.shape[1], x.shape[1], dtype=torch.float32, device=hi.device)
+    _router_dw_split_kernel[(x.shape[1] // _DW_SPLIT_BLOCK_H, splits)](
+        hi,
+        lo,
+        x,
+        p,
+        m,
+        hi.stride(0),
+        x.stride(0),
+        p.stride(0),
+        p.stride(1),
+        N=hi.shape[1],
+        M_PER_SPLIT=per,
+        BLOCK_M=block_m,
+        BLOCK_H=_DW_SPLIT_BLOCK_H,
+        num_warps=_dw_split_warps(hi.shape[1]),
+        num_stages=_DW_SPLIT_STAGES,
+    )
+    return p.sum(0)
+
+
+def router_dx_into(grad_logits: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out += grad_logits @ weight`` for the router's input gradient, in place: FP32-accurate dX
+    rounded to bf16, then added to ``out`` exactly as autograd sums two bf16 gradients, so a caller
+    that owns the input gradient can take the router's share without a separate add kernel.
+
+    ``grad_logits`` [tokens, experts] fp32, ``weight`` [experts, hidden] bf16 contiguous, ``out``
+    [tokens, hidden] bf16 contiguous; the shapes must be ones ``router_gemm_on_triton`` accepts.
+    """
+    g = grad_logits.reshape(-1, grad_logits.shape[-1]).float().contiguous()
+    o = out.view(-1, out.shape[-1])
+    assert out.dtype == torch.bfloat16 and out.is_contiguous() and o.shape == (g.shape[0], weight.shape[1])
+    if _split_backward(g):
+        hi, lo = _split(g)
+        _dx_split(hi, lo, weight, out=o)
+    else:
+        o.add_(_dx(g, weight))
+    return out
+
+
 def _enabled(ctx: PatchContext) -> bool:
     return bool(getattr(get_args(ctx), "moe_router_triton_gemm", False))
 
@@ -272,8 +452,13 @@ def patch_router_triton_gemm(ctx: PatchContext) -> None:
         shape = inp.shape
         x = inp.reshape(-1, shape[-1]).contiguous()
         g = grad_output.reshape(-1, grad_output.shape[-1]).float().contiguous()
-        grad_input = _dx(g, weight).view(*shape)
-        grad_weight = _dw(g, x).to(ctx_.weight_dtype)
+        if _split_backward(g):
+            hi, lo = _split(g)
+            grad_input = _dx_split(hi, lo, weight).view(*shape)
+            grad_weight = _dw_split(hi, lo, x).to(ctx_.weight_dtype)
+        else:
+            grad_input = _dx(g, weight).view(*shape)
+            grad_weight = _dw(g, x).to(ctx_.weight_dtype)
         return grad_input, grad_weight, None, None
 
     fn.forward = staticmethod(forward)
