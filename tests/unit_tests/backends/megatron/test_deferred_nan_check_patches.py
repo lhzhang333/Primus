@@ -157,3 +157,73 @@ def test_fused_grad_check_defers(patched):
     pgb._ParamAndGradBucketGroup.check_grads(group, True, False)  # no host sync, nothing raised
     assert len(deferred._PENDING) == 2
     assert "found NaN in local grad norm for bucket #0" in _message(deferred.flush)
+
+
+@pytest.fixture
+def patched_in_order(patched):
+    """The fused check, then the deferral on top of it, as their priorities order them in a run."""
+    # `patched` applied the deferral first; redo it on top of the fused check, so that its guard
+    # wraps the fused check_grads
+    fused.patch_fused_grad_check_scaling(CTX)
+    rsm.RerunStateMachine.validate_result = deferred._ORIGINAL
+    deferred.patch_deferred_nan_check(CTX)
+    yield
+    deferred._GRADS_DEFERRABLE = None
+
+
+def _nan_group():
+    g = torch.full((1000,), 0.5, dtype=torch.bfloat16, device="cuda")
+    g[7] = float("nan")
+    return SimpleNamespace(buckets=[SimpleNamespace(grad_data=g, gradient_scaling_factor=0.25)])
+
+
+def test_grad_checks_sync_per_group_when_not_deferrable(patched_in_order, monkeypatch):
+    monkeypatch.setattr(deferred, "_grad_checks_deferrable", lambda: (False, "test"))
+    deferred._GRADS_DEFERRABLE = None
+    check_grads = pgb._ParamAndGradBucketGroup.check_grads
+    assert getattr(check_grads, "_primus_guarded", False)
+    message = _message(lambda: check_grads(_nan_group(), True, False))
+    assert "found NaN in local grad norm for bucket #0" in message
+    assert not deferred._PENDING
+
+
+def test_grad_checks_deferred_when_deferrable(patched_in_order, monkeypatch):
+    monkeypatch.setattr(deferred, "_grad_checks_deferrable", lambda: (True, "test"))
+    deferred._GRADS_DEFERRABLE = None
+    pgb._ParamAndGradBucketGroup.check_grads(_nan_group(), True, False)  # nothing raised yet
+    assert len(deferred._PENDING) == 2
+    assert "found NaN in local grad norm for bucket #0" in _message(deferred.flush)
+
+
+@pytest.mark.parametrize(
+    "mega, ep, overlap, queues, expected",
+    [
+        (False, 4, True, "2", True),  # no MegaMoE
+        (True, 1, True, "2", True),  # no expert parallelism
+        (True, 4, False, "2", True),  # reduce-scatters after the backward
+        (True, 4, True, "2", False),
+        (True, 4, True, "4", True),
+        (True, 4, True, "8", True),
+        (True, 4, True, None, True),  # ROCm's default, 4
+    ],
+)
+def test_grad_checks_deferrable(monkeypatch, mega, ep, overlap, queues, expected):
+    from megatron.training import global_vars
+
+    args = SimpleNamespace(
+        use_turbo_mega_moe=mega, expert_model_parallel_size=ep, overlap_grad_reduce=overlap
+    )
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.delenv("PRIMUS_DEFERRED_GRAD_CHECK", raising=False)
+    if queues is None:
+        monkeypatch.delenv("GPU_MAX_HW_QUEUES", raising=False)
+    else:
+        monkeypatch.setenv("GPU_MAX_HW_QUEUES", queues)
+    assert deferred._grad_checks_deferrable()[0] is expected
+
+
+@pytest.mark.parametrize("forced, expected", [("1", True), ("0", False)])
+def test_grad_checks_deferrable_forced(monkeypatch, forced, expected):
+    monkeypatch.setenv("PRIMUS_DEFERRED_GRAD_CHECK", forced)
+    monkeypatch.setenv("GPU_MAX_HW_QUEUES", "2")
+    assert deferred._grad_checks_deferrable()[0] is expected

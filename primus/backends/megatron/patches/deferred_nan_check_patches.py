@@ -27,6 +27,18 @@ any parameter is updated. What changes is the moment: the step runs to the end o
 first. Other rerun modes, non-fatal checks and other rejection functions are untouched.
 
 ``PRIMUS_DEFERRED_NAN_CHECK=0`` turns it off.
+
+The gradient checks keep one sync per bucket group (a flush right after ``check_grads``) unless
+``grad_checks_deferrable``. With MegaMoE at EP > 1 and overlapped gradient reduction, the
+reduce-scatter a bucket group starts must not queue behind the next layers' Mega kernels: their
+workgroups spin until the other EP ranks reach the same kernel, and there are more of them than fit
+on the GPU at once, so their dispatch does not finish while they wait. ROCm runs a process's streams
+on ``GPU_MAX_HW_QUEUES`` hardware queues and dispatches a queue in order; with 2 (Primus' default)
+a reduce-scatter, or the work it waits for, can land in a Mega kernel's queue behind it, and the
+ranks deadlock (MI455X, DeepSeek-V3 proxy at EP4: the second step hangs, high-priority streams for
+the reduce-scatters do not help). With 4 queues it runs. The group sync instead puts each
+reduce-scatter in its queue ahead of those kernels. ``PRIMUS_DEFERRED_GRAD_CHECK=1`` / ``0`` defers
+the gradient checks always / never instead.
 """
 
 import os
@@ -90,18 +102,57 @@ def _flushing(fn):
     return wrapper
 
 
+_GRADS_DEFERRABLE = None
+_MIN_HW_QUEUES = 4
+
+
+def _grad_checks_deferrable():
+    forced = os.environ.get("PRIMUS_DEFERRED_GRAD_CHECK", "auto")
+    if forced in ("0", "1"):
+        return forced == "1", f"PRIMUS_DEFERRED_GRAD_CHECK={forced}"
+    try:
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+    except (ImportError, AssertionError):
+        return True, "no Megatron training arguments"
+    if not getattr(args, "use_turbo_mega_moe", False) or args.expert_model_parallel_size <= 1:
+        return True, "no MegaMoE expert parallelism"
+    if not getattr(args, "overlap_grad_reduce", False):
+        return True, "the gradient reduce-scatters do not overlap the backward"
+    queues = os.environ.get("GPU_MAX_HW_QUEUES") or "4"  # unset: ROCm's default, 4
+    if int(queues) < _MIN_HW_QUEUES:
+        return False, f"MegaMoE at EP > 1 with GPU_MAX_HW_QUEUES={queues} (needs {_MIN_HW_QUEUES})"
+    return True, f"GPU_MAX_HW_QUEUES={queues}"
+
+
+def grad_checks_deferrable() -> bool:
+    """Whether the gradient checks can go without their per-bucket-group sync (module docstring)."""
+    global _GRADS_DEFERRABLE
+    if _GRADS_DEFERRABLE is None:
+        _GRADS_DEFERRABLE, why = _grad_checks_deferrable()
+        log_rank_0(
+            "[Patch:megatron.rerun.deferred_nan_check] gradient checks "
+            f"{'deferred' if _GRADS_DEFERRABLE else 'keep one sync per bucket group'}: {why}"
+        )
+    return _GRADS_DEFERRABLE
+
+
 @register_patch(
     "megatron.rerun.deferred_nan_check",
     backend="megatron",
     phase="before_train",
     description="One host sync per step for the fatal NaN/Inf checks of losses and gradient norms",
     condition=_enabled,
+    # after megatron.ddp.fused_grad_check_scaling (50): the guard below wraps its check_grads
+    priority=60,
 )
 def patch_deferred_nan_check(ctx: PatchContext) -> None:
     global _ORIGINAL
     from megatron.core.distributed.distributed_data_parallel import (
         DistributedDataParallel,
     )
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
     from megatron.core.optimizer import optimizer as mcore_optimizer
     from megatron.core.rerun_state_machine import RerunStateMachine
 
@@ -140,6 +191,18 @@ def patch_deferred_nan_check(ctx: PatchContext) -> None:
         if fn is not None and not getattr(fn, "_primus_flushes", False):
             setattr(owner, name, _flushing(fn))
             flushed.append(f"{owner.__name__}.{name}")
+    check_grads = _ParamAndGradBucketGroup.check_grads
+    if not getattr(check_grads, "_primus_guarded", False):
+
+        @wraps(check_grads)
+        def guarded_check_grads(self, *args, **kwargs):
+            out = check_grads(self, *args, **kwargs)
+            if not grad_checks_deferrable():
+                flush()  # one sync per bucket group, as without the deferral
+            return out
+
+        guarded_check_grads._primus_guarded = True
+        _ParamAndGradBucketGroup.check_grads = guarded_check_grads
     try:
         from megatron.training import training
 
