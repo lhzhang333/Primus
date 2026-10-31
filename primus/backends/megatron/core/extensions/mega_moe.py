@@ -540,15 +540,21 @@ class PrimusTurboMegaMoELayer(MegatronModule):
 
         if early:
             shared_out = fork_shared_expert()
-        # dense probs [T, E], aux-loss grad baked in
-        probs, _ = self.router(router_input, padding_mask, **router_kwargs)
-        if side is not None and not early:
-            probs = _JoinStreamInBackward.apply(probs, side)
-            shared_out = fork_shared_expert()
-        probs = probs.reshape(-1, self.config.num_moe_experts)
+        fused_topk = getattr(self.router, "fused_topk_enabled", None)
+        if fused_topk is not None and fused_topk(router_input, padding_mask, router_kwargs):
+            # moe_router_fused_triton: the same top-k straight from the fused router (its gating GEMM
+            # is on Triton, so the shared expert forked early)
+            topk_weights, topk_idx = self.router.fused_topk(router_input)
+        else:
+            # dense probs [T, E], aux-loss grad baked in
+            probs, _ = self.router(router_input, padding_mask, **router_kwargs)
+            if side is not None and not early:
+                probs = _JoinStreamInBackward.apply(probs, side)
+                shared_out = fork_shared_expert()
+            probs = probs.reshape(-1, self.config.num_moe_experts)
 
-        # dense -> sparse top-k
-        topk_weights, topk_idx = probs.topk(self.router.topk, dim=-1)
+            # dense -> sparse top-k
+            topk_weights, topk_idx = probs.topk(self.router.topk, dim=-1)
 
         x = hidden_states.reshape(-1, self.hidden_size).to(torch.bfloat16)
         topk_weights = topk_weights.to(torch.float32)

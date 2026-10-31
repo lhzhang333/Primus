@@ -178,6 +178,125 @@ class PrimusTopKRouter(TopKRouter):
 
         return scores, routing_map
 
+    def fused_topk_enabled(self, hidden_states: torch.Tensor, padding_mask=None, router_kwargs=None) -> bool:
+        """Whether ``fused_topk`` replaces ``forward`` + the dense top-k for this input:
+        ``moe_router_fused_triton`` is set and the router uses only what the fused kernels replay --
+        TE's fused sigmoid top-k (expert bias and group limits allowed), the seq aux loss, forced load
+        balancing, and the FP32 gating GEMM on ``moe_router_triton_gemm``'s kernels (gfx1250)."""
+        args = get_args()
+        if not getattr(args, "moe_router_fused_triton", False) or padding_mask is not None or router_kwargs:
+            return False
+        from primus.backends.megatron.patches.moe_patches.router_triton_gemm_patches import (
+            _gfx1250,
+            router_gemm_on_triton,
+        )
+
+        cfg = self.config
+        e, topk = cfg.num_moe_experts, self.topk
+        groups, group_topk = cfg.moe_router_num_groups, cfg.moe_router_group_topk
+
+        def pow2(n):
+            return n is not None and n > 0 and n & (n - 1) == 0
+
+        if groups is not None and groups > 1 and group_topk:
+            grouped_ok = (
+                pow2(groups)
+                and e % groups == 0
+                and pow2(e // groups)
+                and topk % group_topk == 0
+                and group_topk <= groups
+            )
+        else:
+            grouped_ok = True
+        force_type = getattr(args, "moe_router_force_load_balancing_type", "uniform")
+        return bool(
+            cfg.moe_router_dtype == "fp32"
+            and cfg.moe_router_fusion
+            and router_gemm_on_triton(hidden_states, self.weight, self.bias, torch.float32)
+            and _gfx1250(hidden_states)
+            and self.score_function == "sigmoid"
+            and not cfg.moe_router_pre_softmax
+            and self.routing_type not in ("sinkhorn", "quantile_balancing")
+            and self.get_aux_loss_coeff("aux_loss") == 0
+            and self.get_aux_loss_coeff("global_aux_loss") == 0
+            and topk in (1, 2, 4, 8)
+            and pow2(e)
+            and 16 <= e <= 256
+            and grouped_ok
+            and not cfg.moe_z_loss_coeff
+            and cfg.moe_input_jitter_eps is None
+            and getattr(cfg, "moe_router_force_biased", None) is None
+            and cfg.moe_expert_capacity_factor is None
+            and getattr(self, "router_replay", None) is None
+            and not self.calculate_per_token_loss
+            and self.tp_cp_group.size() == 1
+            and not getattr(args, "router_logit_softcapping", None)
+            and not (
+                args.enable_primus_turbo
+                and args.moe_use_fused_router_with_aux_score
+                and not self.enable_expert_bias
+            )
+            and (not cfg.moe_router_force_load_balancing or force_type in ("even", "spread", "uniform"))
+            and hidden_states.dim() == 3
+        )
+
+    def fused_topk(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(top-k weights [T, topk] fp32, top-k indices [T, topk] int64) as MegaMoE takes them from
+        ``forward``'s dense probabilities, bit for bit, from the fused Triton router (see
+        ``fused_router_triton``): the expert-bias token counts and the seq aux loss (attached to the
+        weights and logged as ``routing`` does) included. Use only where ``fused_topk_enabled``."""
+        from megatron.core.transformer.moe.moe_utils import RandomSTE
+
+        from primus.backends.megatron.core.transformer.moe.fused_router_triton import (
+            FusedRouterFunction,
+            te_aux_loss_coeff,
+        )
+
+        self._maintain_float32_expert_bias()
+        cfg = self.config
+        args = get_args()
+        seq, bsz = hidden_states.shape[:2]
+        seq_coeff = self.get_aux_loss_coeff("seq_aux_loss")
+        aux = bool(self.training and torch.is_grad_enabled() and seq_coeff > 0)
+        mode, random_logits = 0, None
+        if cfg.moe_router_force_load_balancing:
+            random_logits = lambda logits: RandomSTE.forward(None, logits)  # noqa: E731
+            mode = {"even": 1, "spread": 2}.get(
+                getattr(args, "moe_router_force_load_balancing_type", "uniform"), 0
+            )
+        grouped = (
+            cfg.moe_router_num_groups is not None
+            and cfg.moe_router_num_groups > 1
+            and cfg.moe_router_group_topk
+        )
+        fcfg = dict(
+            topk=self.topk,
+            num_groups=cfg.moe_router_num_groups if grouped else None,
+            group_topk=cfg.moe_router_group_topk if grouped else None,
+            scaling=(
+                cfg.moe_router_topk_scaling_factor if cfg.moe_router_topk_scaling_factor is not None else 1.0
+            ),
+            bsz=bsz,
+            mode=mode,
+            aux=aux,
+            aux_coeff=te_aux_loss_coeff(cfg.num_moe_experts, seq_coeff, self.topk, seq) if aux else 0.0,
+            random_logits=random_logits,
+        )
+        count = self.local_tokens_per_expert if self.enable_expert_bias and torch.is_grad_enabled() else None
+        weights, idx, _, aux_loss = FusedRouterFunction.apply(
+            hidden_states, self.weight, self.expert_bias, count, fcfg
+        )
+        if aux:
+            weights = self.attach_and_log_load_balancing_loss(
+                weights,
+                seq_coeff,
+                aux_loss,
+                "seq_load_balancing_loss",
+                self.tp_cp_group,
+                valid_token_count=seq * bsz,
+            )
+        return weights, idx
+
     def _force_even_routing(
         self, scores: torch.Tensor, routing_map: torch.Tensor, spread: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:

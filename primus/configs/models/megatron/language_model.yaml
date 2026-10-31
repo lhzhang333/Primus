@@ -116,6 +116,10 @@ moe_router_bwd_bf16: false
 # Triton forward/backward GEMMs for an FP32 router with BF16 input/weight; the backward keeps FP32
 # accuracy. Not installed together with moe_router_bwd_bf16.
 moe_router_triton_gemm: false
+# MegaMoE on gfx1250 with moe_router_triton_gemm and moe_router_fusion: the whole router (sigmoid top-k
+# with expert bias and group limits, seq aux loss, MegaMoE's top-k) in one Triton kernel each way,
+# bit-identical to TE's kernels; other router features keep the unfused path.
+moe_router_fused_triton: false
 moe_router_score_function: softmax # softmax, sigmoid
 moe_router_topk: 2
 moe_router_pre_softmax: false
