@@ -13,6 +13,30 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import get_args
 
 from primus.backends.megatron.core.extensions.logits_processor import fused_softcap
+from primus.core.utils.gpu_arch import is_gfx1250
+
+_WARNED_EXPERT_BIAS = False
+
+
+def _warn_fused_router_without_expert_bias(kept: bool):
+    global _WARNED_EXPERT_BIAS
+    if not _WARNED_EXPERT_BIAS:
+        _WARNED_EXPERT_BIAS = True
+        from primus.core.utils.module_utils import warning_rank_0
+
+        if kept:
+            warning_rank_0(
+                "moe_router_enable_expert_bias does not reach expert selection: Primus-Turbo's fused "
+                "router (moe_use_fused_router_with_aux_score) cannot add the expert bias to the selection "
+                "scores. Set moe_use_fused_router_with_aux_score: false (and moe_router_fusion: true for "
+                "TE's fused kernels) to apply it."
+            )
+        else:
+            warning_rank_0(
+                "moe_use_fused_router_with_aux_score is ignored while moe_router_enable_expert_bias is on: "
+                "Primus-Turbo's fused router cannot add the expert bias to the selection scores. Using "
+                "Megatron's routing instead; set moe_router_fusion: true for its fused (TE) kernels."
+            )
 
 
 def force_balanced_slots(num_tokens: int, topk: int, num_experts: int, spread: bool, device) -> torch.Tensor:
@@ -102,7 +126,15 @@ class PrimusTopKRouter(TopKRouter):
             # grok2 router logit softcapping
             fused_softcap(logits, args.router_logit_softcapping)
 
-        if args.enable_primus_turbo and args.moe_use_fused_router_with_aux_score:
+        turbo_fused = args.enable_primus_turbo and args.moe_use_fused_router_with_aux_score
+        if turbo_fused and self.enable_expert_bias:
+            # Primus-Turbo's fused router selects experts without the expert bias, which silently
+            # disables aux-loss-free load balancing. On gfx1250 Megatron's routing, which applies it,
+            # takes over (moe_router_fusion runs that on TE's fused kernels); other architectures keep
+            # the fused router for now and only warn.
+            turbo_fused = not is_gfx1250()
+            _warn_fused_router_without_expert_bias(kept=turbo_fused)
+        if turbo_fused:
             scores, routing_map = self.fused_router_and_auxiliary_loss(logits)
         else:
             scores, routing_map = super().routing(logits, **kwargs)
