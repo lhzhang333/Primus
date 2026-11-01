@@ -68,6 +68,20 @@ if [[ -n "${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-}" ]]; then
 fi
 export MOCK_DATA=${MOCK_DATA:-True}
 export PROFILE=${PROFILE:-False}
+# 1: bind each rank's CPU threads and host memory to the NUMA node of its GPU (0.6% faster on 4 GPUs,
+# with even and with spread routing alike)
+export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}
+# 4 hardware queues, not base_env.sh's 2: 0.2% faster on 4 GPUs, and MegaMoE's deferred gradient checks
+# (megatron.rerun.deferred_nan_check) need them at EP > 1, or they keep one sync per bucket group
+export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-4}
+# 1: fold the residual adds into the RMSNorms, and the MoE layer's routed + shared add and its input-gradient
+# adds into the norms around it (fused_residual_rmsnorm.py, MoE mode); bit for bit the unfused layers
+export PRIMUS_FUSED_RESIDUAL_NORM_MOE=${PRIMUS_FUSED_RESIDUAL_NORM_MOE:-1}
+# 1: the MegaMoE expert wgrads overwrite main_grad on their first write of an iteration, so DDP
+# clears only the rest of the gradient buffers (2/3 of a rank's buffer is expert weights; 0.3% faster
+# at EP1). 0: clear everything. PRIMUS_TURBO_GRAD_OWNERSHIP_POISON=1 fills the skipped slices with NaN
+# to prove they are rewritten.
+export PRIMUS_TURBO_GRAD_OWNERSHIP=${PRIMUS_TURBO_GRAD_OWNERSHIP:-1}
 # 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
 export PATCH_TRITON_EXPERT_SCHEDULING=${PATCH_TRITON_EXPERT_SCHEDULING:-1}
 # hipBLASLt kernels tuned for this example's GEMMs (README.md); empty: hipBLASLt's own choice. hipBLASLt
@@ -164,6 +178,11 @@ if [[ -n "${TURBO_DIR}" ]]; then
         --env "PYTHONPATH=${TURBO_DIR}:${TURBO_DIR}/build/pydeps:${PWD}:${PWD}/third_party/Megatron-LM"
         --env PYTHONDONTWRITEBYTECODE=1
     )
+fi
+
+# base_env.sh only exports ENABLE_NUMA_BINDING; primus-cli direct binds with --numa
+if [[ "${ENABLE_NUMA_BINDING}" == 1 ]]; then
+    ENV_ARGS+=(--numa)
 fi
 
 if [[ -n "${PRIMUS_RECOMPUTE_LAYER_IDS}" ]]; then
