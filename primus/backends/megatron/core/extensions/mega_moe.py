@@ -494,8 +494,18 @@ class PrimusTurboMegaMoELayer(MegatronModule):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        router_input: Optional[torch.Tensor] = None,
+        shared_expert_input: Optional[torch.Tensor] = None,
+        split_shared_output: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """``router_input`` / ``shared_expert_input``: aliases of ``hidden_states`` for the router and
+        the shared expert, defaulting to ``hidden_states``. The fused residual RMSNorm hands each
+        consumer its own alias, so their input gradients reach its backward separately instead of
+        being added by autograd. ``split_shared_output``: return ``((routed, shared), None)`` rather
+        than their sum, for a caller that adds them itself (in the next fused residual RMSNorm)."""
         in_shape = hidden_states.shape
+        router_input = hidden_states if router_input is None else router_input
+        shared_expert_input = hidden_states if shared_expert_input is None else shared_expert_input
         # transpose [bsz, seq] -> [seq, bsz]
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
@@ -519,19 +529,19 @@ class PrimusTurboMegaMoELayer(MegatronModule):
             if self.shared_expert_overlap
             else (None, None)
         )
-        early = side is not None and self._router_gemm_on_triton(hidden_states)
+        early = side is not None and self._router_gemm_on_triton(router_input)
 
         def fork_shared_expert():
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                out = self.shared_experts(hidden_states)
-            hidden_states.record_stream(side)
+                out = self.shared_experts(shared_expert_input)
+            shared_expert_input.record_stream(side)
             return out
 
         if early:
             shared_out = fork_shared_expert()
         # dense probs [T, E], aux-loss grad baked in
-        probs, _ = self.router(hidden_states, padding_mask, **router_kwargs)
+        probs, _ = self.router(router_input, padding_mask, **router_kwargs)
         if side is not None and not early:
             probs = _JoinStreamInBackward.apply(probs, side)
             shared_out = fork_shared_expert()
@@ -551,16 +561,21 @@ class PrimusTurboMegaMoELayer(MegatronModule):
             and self.experts.prefetch_dispatch(x, topk_idx, topk_weights)
         )
         if shared_first:
-            shared_out = self.shared_experts(hidden_states)
+            shared_out = self.shared_experts(shared_expert_input)
         y = self.experts(x, topk_idx, topk_weights)
         y = y.reshape(in_shape).to(hidden_states.dtype)
         if side is not None:
             main.wait_stream(side)
             shared_out.record_stream(main)
-            y = y + _RecordStreamInBackward.apply(shared_out, side)
+            shared_out = _RecordStreamInBackward.apply(shared_out, side)
         elif self.shared_experts is not None:
-            y = y + (shared_out if shared_first else self.shared_experts(hidden_states))
-        return y, None
+            if not shared_first:
+                shared_out = self.shared_experts(shared_expert_input)
+        else:
+            return y, None
+        if split_shared_output:
+            return (y, shared_out), None
+        return y + shared_out, None
 
     def sharded_state_dict(
         self,
