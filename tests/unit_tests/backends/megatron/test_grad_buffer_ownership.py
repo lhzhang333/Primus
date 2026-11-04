@@ -282,11 +282,25 @@ class TestPreCollectiveValidation:
 
 
 class TestIsEnabled:
-    def test_disabled_short_circuits_before_reading_args(self, monkeypatch):
+    def test_disabled_without_first_write(self, monkeypatch):
         monkeypatch.setattr(gbo, "_DISABLED", True)
-        monkeypatch.setattr(gbo, "get_args", lambda ctx: pytest.fail("must not read args when disabled"))
+        monkeypatch.setattr(gbo, "get_args", lambda ctx: SimpleNamespace(gradient_accumulation_fusion=True))
+        monkeypatch.setattr(
+            gbo, "is_primus_turbo_can_patch", lambda ctx: pytest.fail("must short-circuit before this")
+        )
 
         assert gbo._is_enabled(ctx=None) is False
+
+    def test_first_write_enables_without_env_or_fusion(self, monkeypatch):
+        monkeypatch.setattr(gbo, "_DISABLED", True)
+        monkeypatch.setattr(
+            gbo,
+            "get_args",
+            lambda ctx: SimpleNamespace(gradient_accumulation_fusion=False, grad_buffer_first_write=True),
+        )
+        monkeypatch.setattr(gbo, "is_primus_turbo_can_patch", lambda ctx: True)
+
+        assert gbo._is_enabled(ctx=None) is True
 
     def test_false_when_gradient_accumulation_fusion_is_off(self, monkeypatch):
         monkeypatch.setattr(gbo, "_DISABLED", False)
@@ -417,3 +431,50 @@ class TestCurrentStepEligibility:
         monkeypatch.setattr(gbo, "_get_num_microbatches", unavailable)
 
         assert gbo._discard_ownership_for_step(SimpleNamespace(curr_iteration=3)) is True
+
+
+class TestFirstWriteHook:
+    """DDP's backward hook as a producer: copy on the iteration's first gradient, add afterwards."""
+
+    def _setup(self, monkeypatch):
+        recorded = []
+        ownership = SimpleNamespace(record_overwrite=lambda t: recorded.append((t.data_ptr(), t.numel())))
+        param = torch.nn.Parameter(torch.zeros(6, dtype=torch.bfloat16))  # bf16 params, fp32 main_grad
+        param.main_grad = torch.full((6,), 7.0)  # stale: a skipped slice
+        param.grad_added_to_main_grad = False
+        calls = []
+
+        def megatron_hook(*unused):
+            # what Megatron's hook does with the flag the producer sets
+            calls.append(param.grad_added_to_main_grad)
+            if param.grad is not None and not param.grad_added_to_main_grad:
+                param.main_grad.add_(param.grad.data)
+            param.grad = None
+
+        ddp = SimpleNamespace(param_to_bucket_group={param: object()})
+        hook = gbo._make_first_write_hook(ddp, param, megatron_hook, ownership)
+        monkeypatch.setitem(gbo._state, "epoch", 1)
+        return param, hook, recorded, calls
+
+    def test_first_gradient_overwrites_later_ones_add(self, monkeypatch):
+        param, hook, recorded, calls = self._setup(monkeypatch)
+        param.grad = torch.full((6,), 2.0, dtype=torch.bfloat16)
+        hook()
+        assert torch.equal(param.main_grad, torch.full((6,), 2.0))
+        assert recorded == [(param.main_grad.data_ptr(), 6)] and calls == [True]
+        assert param.grad is None and param.grad_added_to_main_grad is False
+        param.grad = torch.full((6,), 3.0, dtype=torch.bfloat16)  # a second micro-batch: add
+        hook()
+        assert torch.equal(param.main_grad, torch.full((6,), 5.0)) and len(recorded) == 1
+        gbo._state["epoch"] = 2  # next iteration: overwrite again
+        param.grad = torch.full((6,), 1.0, dtype=torch.bfloat16)
+        hook()
+        assert torch.equal(param.main_grad, torch.full((6,), 1.0)) and len(recorded) == 2
+
+    @pytest.mark.parametrize("attr", ["grad_added_to_main_grad", "zero_out_wgrad"])
+    def test_keeps_the_add_when_the_hook_must(self, monkeypatch, attr):
+        param, hook, recorded, calls = self._setup(monkeypatch)
+        setattr(param, attr, True)
+        param.grad = torch.full((6,), 2.0, dtype=torch.bfloat16)
+        hook()
+        assert recorded == []

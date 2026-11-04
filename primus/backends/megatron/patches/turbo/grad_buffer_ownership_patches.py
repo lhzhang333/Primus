@@ -52,6 +52,18 @@ What makes the skip safe:
 Set ``PRIMUS_TURBO_GRAD_OWNERSHIP=1`` to opt in. It defaults off, so workloads
 that have not explicitly validated the producer/consumer contract continue to
 zero the whole buffer.
+
+``grad_buffer_first_write: true`` (trainer config) also opts in, with a second
+producer for the parameters whose gradient reaches the buffer through DDP's
+backward hook (``param.grad``, no ``gradient_accumulation_fusion``): the first
+time the hook runs for a parameter in an iteration it *copies* the gradient into
+``main_grad`` instead of adding it, and logs the slice like the beta=0 wgrad
+does; later micro-batches add as before. A copy is the add whenever the slice
+was cleared, and the only correct first write when it was skipped, so the clear
+of those slices and the add's read of them both go away. Parameters whose hook
+cannot take the copy (``grad_added_to_main_grad``, ``zero_out_wgrad``, a
+``main_grad`` that is not exactly the parameter's slice) keep the add and are
+never logged, so their slices are always cleared.
 """
 
 from __future__ import annotations
@@ -70,7 +82,9 @@ _POISON = os.environ.get("PRIMUS_TURBO_GRAD_OWNERSHIP_POISON", "0") == "1"
 
 # Rebuilt every iteration by the wrapped ``zero_grad_buffer``; consumed by the
 # wrapped ``reset`` of every buffer belonging to that iteration.
-_state: dict[str, object] = {"owned": frozenset(), "seen": set(), "logged": False}
+_state: dict[str, object] = {"owned": frozenset(), "seen": set(), "logged": False, "epoch": 0}
+# the iteration (epoch) a parameter's hook last copied into its main_grad
+_FIRST_WRITE_EPOCH = "_primus_first_write_epoch"
 
 
 def _rotate_ownership(grad_ownership, *, discard: bool) -> frozenset[Slice]:
@@ -104,10 +118,14 @@ def _discard_ownership_for_step(args) -> bool:
         return True
 
 
+def _first_write(args) -> bool:
+    return bool(getattr(args, "grad_buffer_first_write", False))
+
+
 def _is_enabled(ctx: PatchContext) -> bool:
-    if _DISABLED:
-        return False
     args = get_args(ctx)
+    if _DISABLED and not _first_write(args):
+        return False
 
     # Ownership recording happens in Python after the beta=0 custom op and is
     # therefore not replayed by CUDA graphs. Keep full framework clearing for
@@ -136,10 +154,41 @@ def _is_enabled(ctx: PatchContext) -> bool:
         }:
             return False
 
-    # The claim this patch trusts is only ever recorded by the fused wgrad path.
-    if not bool(getattr(args, "gradient_accumulation_fusion", False)):
+    # The claims this patch trusts are recorded by the fused wgrad path, or by the backward hook when
+    # grad_buffer_first_write is on.
+    if not bool(getattr(args, "gradient_accumulation_fusion", False)) and not _first_write(args):
         return False
     return is_primus_turbo_can_patch(ctx)
+
+
+def _make_first_write_hook(ddp, param, hook, grad_ownership):
+    """DDP's backward hook for ``param``, copying the iteration's first gradient into ``main_grad``."""
+
+    def first_write_hook(*unused):
+        grad = param.grad
+        main_grad = getattr(param, "main_grad", None)
+        if (
+            grad is not None
+            and main_grad is not None
+            and param in ddp.param_to_bucket_group
+            and not getattr(param, "grad_added_to_main_grad", False)
+            and not getattr(param, "zero_out_wgrad", False)
+            and getattr(param, _FIRST_WRITE_EPOCH, None) != _state["epoch"]
+            and main_grad.is_contiguous()
+            and main_grad.shape == grad.shape
+        ):
+            setattr(param, _FIRST_WRITE_EPOCH, _state["epoch"])
+            main_grad.copy_(grad.data)
+            grad_ownership.record_overwrite(main_grad)
+            # the original hook then skips its add, drops param.grad and marks the gradient ready
+            param.grad_added_to_main_grad = True
+            try:
+                return hook(*unused)
+            finally:
+                param.grad_added_to_main_grad = False
+        return hook(*unused)
+
+    return first_write_hook
 
 
 def _owned_slices(buffer) -> list[tuple[int, int, Slice]]:
@@ -264,6 +313,7 @@ def patch_grad_buffer_ownership(ctx: PatchContext) -> None:
                 grad_ownership,
                 discard=_discard_ownership_for_step(args),
             )
+            _state["epoch"] += 1
             seen.clear()
         seen.add(id(self))
         return original_zero_grad_buffer(self)
@@ -280,6 +330,13 @@ def patch_grad_buffer_ownership(ctx: PatchContext) -> None:
         return original_start_grad_sync(self, *args, **kwargs)
 
     reset._primus_grad_ownership = True
+    if _first_write(args):
+        original_make_hook = DistributedDataParallel._make_backward_post_hook
+
+        def _make_backward_post_hook(self, param):
+            return _make_first_write_hook(self, param, original_make_hook(self, param), grad_ownership)
+
+        DistributedDataParallel._make_backward_post_hook = _make_backward_post_hook
     DistributedDataParallel.zero_grad_buffer = zero_grad_buffer
     _ParamAndGradBuffer.reset = reset
     _ParamAndGradBucketGroup.start_grad_sync = start_grad_sync
@@ -288,5 +345,10 @@ def patch_grad_buffer_ownership(ctx: PatchContext) -> None:
         "[Patch:megatron.turbo.grad_buffer_ownership] Wrapped zero_grad_buffer() and "
         "_ParamAndGradBuffer.reset(), with pre-collective overwrite validation; owned "
         "slices are reported on the first iteration that has any."
+        + (
+            "  DDP's backward hook copies each parameter's first gradient (grad_buffer_first_write)."
+            if _first_write(args)
+            else ""
+        )
         + ("  POISON MODE: skipped slices filled with NaN." if _POISON else "")
     )
