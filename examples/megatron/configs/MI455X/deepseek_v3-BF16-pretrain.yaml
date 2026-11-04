@@ -147,3 +147,6 @@ modules:
 
       # gradient clipping's scale pass in one Triton launch per dtype (bit-identical gradients)
       clip_grad_triton_scale: true
+
+      # MLA RoPE query backward with one contiguous store per row (Megatron's kernel stores stride-2)
+      mla_rope_bwd_contiguous_store: true
