@@ -45,6 +45,19 @@ def take(param):
     return param.__dict__.pop(_PENDING, None)
 
 
+def scale(grad, coeff) -> None:
+    """``grad *= coeff`` in place as Megatron's clip scales it (TE ``multi_tensor_scale``: the fp32
+    product rounded once to nearest even; torch's bf16 ``mul_`` rounds its ties differently on ROCm)."""
+    if grad.is_cuda and grad.is_contiguous() and grad.dtype in (torch.float32, torch.bfloat16, torch.float16):
+        from primus.backends.megatron.core.extensions._triton.grad_scale import (
+            scale_by_device_scalar,
+        )
+
+        scale_by_device_scalar(grad, coeff)
+    else:
+        grad.mul_(coeff)
+
+
 def apply_eagerly(params, use_decoupled_grad: bool) -> None:
     """Scale the gradients of ``params`` by their pending coefficients in place, as clipping would have."""
     for p in params:
@@ -53,4 +66,4 @@ def apply_eagerly(params, use_decoupled_grad: bool) -> None:
             continue
         grad = getattr(p, "decoupled_grad", None) if use_decoupled_grad else p.grad
         if grad is not None:
-            grad.mul_(coeff)
+            scale(grad, coeff)

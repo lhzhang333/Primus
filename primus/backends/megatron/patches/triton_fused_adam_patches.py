@@ -15,11 +15,12 @@ saturated; the Triton kernel sizes its grid to the device's CU count. ROCm TE
 builds with the custom Adam kernel are not capped. On by default; set
 ``use_triton_fused_adam: false`` to keep TE ``FusedAdam``.
 
-On gfx1250, with the precision-aware optimizer's param remainders, the Triton
-step also takes the global-norm clip coefficient while it reads the gradients,
-so clipping no longer scales them in a pass of its own (bit for bit the same
-update). ``fold_clip_into_adam: false`` keeps the separate pass, as does
-``log_num_zeros_in_grad``, which counts the zeros of the clipped gradients.
+On gfx1250 the Triton step also takes the global-norm clip coefficient while it
+reads the gradients (the plain FP32-state path for fp32 gradients, and the
+precision-aware optimizer's param remainders), so clipping no longer scales them
+in a pass of its own (bit for bit the same update). ``fold_clip_into_adam:
+false`` keeps the separate pass, as does ``log_num_zeros_in_grad``, which counts
+the zeros of the clipped gradients.
 
 Mechanism:
     ``_get_megatron_optimizer_based_on_param_groups`` reads the module global
@@ -88,7 +89,7 @@ def patch_triton_fused_adam(ctx: PatchContext) -> None:
 
     from primus.backends.megatron.core.optimizer import deferred_clip
 
-    # only the gfx1250 param-remainder step marks its parameters as folding the clip
+    # only the Triton steps validated on gfx1250 mark their parameters as folding the clip
     args = get_args(ctx)
     deferred_clip.ENABLED = bool(getattr(args, "fold_clip_into_adam", True)) and not bool(
         getattr(args, "log_num_zeros_in_grad", False)
@@ -97,5 +98,5 @@ def patch_triton_fused_adam(ctx: PatchContext) -> None:
     mark_patched(optimizer_module, _PATCH_KEY)
     log_rank_0(
         f"[Patch:{_PATCH_KEY}] megatron.core.optimizer.Adam -> TritonFusedAdam "
-        f"(clip folded into the gfx1250 param-remainder step: {deferred_clip.ENABLED})."
+        f"(clip folded into the gfx1250 Triton steps: {deferred_clip.ENABLED})."
     )
