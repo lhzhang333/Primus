@@ -4,7 +4,6 @@
 # See LICENSE for license information.
 ###############################################################################
 
-import inspect
 import sys
 from types import SimpleNamespace
 from typing import Any, Dict, Union
@@ -13,6 +12,15 @@ from primus.core.utils import logger
 
 _rank = 0
 _world_size = 1
+
+
+def _caller():
+    """(module name, function name, line) of the code that called the logging function: two frames up from
+    here. ``sys._getframe`` reads that one frame; ``inspect.stack()`` built every frame of the stack with its
+    source lines, which ``print`` (bound to ``debug_rank_all``) paid on each call, once per training iteration
+    for the iteration log line."""
+    frame = sys._getframe(2)
+    return frame.f_globals["__name__"].split(".")[-1], frame.f_code.co_name, frame.f_lineno
 
 
 ######################################################log before torch distributed initialized
@@ -26,11 +34,7 @@ def set_logging_rank(rank, world_size):
 def log_rank_0(msg, *args, **kwargs):
     log_func = logger.info_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == 0:
         log_func(msg, module_name, function_name, line)
@@ -39,11 +43,7 @@ def log_rank_0(msg, *args, **kwargs):
 def log_rank_last(msg, *args, **kwargs):
     log_func = logger.info_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == _world_size - 1:
         log_func(msg, module_name, function_name, line)
@@ -52,11 +52,7 @@ def log_rank_last(msg, *args, **kwargs):
 def log_rank_all(msg, *args, **kwargs):
     log_func = logger.info_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     log_func(msg, module_name, function_name, line)
 
@@ -64,11 +60,7 @@ def log_rank_all(msg, *args, **kwargs):
 def log_kv_rank_0(key, value):
     log_func = logger.log_kv_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == 0:
         log_func(key, value, module_name, function_name, line)
@@ -84,11 +76,7 @@ def debug_rank_0(*args, **kwargs):
     msg = sep.join(str(a) for a in args)
     log_func = logger.debug_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == 0:
         log_func(msg, module_name, function_name, line)
@@ -118,11 +106,7 @@ def debug_rank_all(*args, **kwargs):
     handling_exception = sys.exc_info()[0] is not None
     log_func = logger.error_with_caller if (to_stderr and handling_exception) else logger.debug_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     log_func(msg, module_name, function_name, line)
 
@@ -130,11 +114,7 @@ def debug_rank_all(*args, **kwargs):
 def warning_rank_0(msg, *args, **kwargs):
     log_func = logger.warning_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == 0:
         log_func(msg, module_name, function_name, line)
@@ -143,11 +123,7 @@ def warning_rank_0(msg, *args, **kwargs):
 def error_rank_0(msg, *args, **kwargs):
     log_func = logger.error_with_caller
 
-    caller = inspect.stack()[1]
-    caller_frame = caller.frame
-    function_name = caller_frame.f_code.co_name
-    module_name = caller_frame.f_globals["__name__"].split(".")[-1]
-    line = caller.lineno
+    module_name, function_name, line = _caller()
 
     if _rank == 0:
         log_func(msg, module_name, function_name, line)
