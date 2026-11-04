@@ -141,6 +141,10 @@ output_layer_gemm_hipkittens: false
 # dtype instead of multi_tensor_apply's hundreds of capped launches. Bit-identical results.
 clip_grad_triton_scale: false
 
+# MLA YaRN RoPE query backward (Megatron's fused kernel) with one contiguous store per row instead of two
+# stride-2 stores. Same arithmetic; a differently contracted multiply-add can round a few elements apart.
+mla_rope_bwd_contiguous_store: false
+
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
 # master barely moves (improves MXFP4 training convergence). Requires
