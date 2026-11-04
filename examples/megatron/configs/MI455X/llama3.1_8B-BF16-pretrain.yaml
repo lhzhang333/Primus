@@ -58,6 +58,8 @@ modules:
 
       # data
       mock_data: true
+      # causal attention takes no mask: do not build and copy a [seq, seq] one per sample
+      create_attention_mask_in_dataloader: false
       train_data_path: ${PRIMUS_TOKENIZED_DATA_PATH:null}
       valid_data_path: null
       test_data_path: null
@@ -84,7 +86,14 @@ modules:
       enable_primus_turbo: true
       use_turbo_attention: true
       use_turbo_rms_norm: true
+      # MLP SwiGLU on Primus-Turbo's kernels (a Primus-Turbo without them keeps Megatron's)
+      use_turbo_swiglu: true
+      # packed-QKV RoPE without a split, on Primus-Turbo's FlyDSL kernels
+      fused_single_qkv_rope: true
+      use_turbo_fused_qkv_rope: true
 
-      # cross entropy
+      # cross entropy: Primus-Turbo's, its backward overwriting the logits with their gradient
       cross_entropy_fusion_impl: "te"
       cross_entropy_loss_fusion: true
+      use_turbo_cross_entropy: true
+      turbo_ce_overwrite_input: true

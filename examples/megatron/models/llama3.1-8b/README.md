@@ -83,6 +83,18 @@ the container. With Primus's own tuning flow (`PRIMUS_HIPBLASLT_TUNING=1`, see `
 launcher sets no default, so its stage 3 uses the stage-2 result unless the variable is set. The file was made
 like the DeepSeek-V3 example's; see hipBLASLt tuning in its README.
 
+**Fused kernels in the config.** The experiment yaml also turns on, beyond the launcher's switches:
+`use_turbo_swiglu` (the MLP's SwiGLU on Primus-Turbo's elementwise kernels; a Primus-Turbo without
+`primus_turbo.pytorch.ops.swiglu` keeps Megatron's `torch.compile` kernels and logs a warning),
+`fused_single_qkv_rope` with `use_turbo_fused_qkv_rope` (the packed QKV goes through one RoPE call on
+Primus-Turbo's FlyDSL kernels instead of a split, a query copy, RoPE per tensor and a concatenation of
+the gradients), `use_turbo_cross_entropy` with `turbo_ce_overwrite_input` (Primus-Turbo's cross entropy,
+whose backward writes the logits' gradient over the logits), and `create_attention_mask_in_dataloader:
+false` (causal attention takes no mask, so the data loader builds none). On gfx1250, Primus also checks
+the NaN / Inf validations of a step with one host sync (`defer_nan_check`) and folds gradient clipping
+into the Triton Adam step (`fold_clip_into_adam`). Any of them can be turned off by appending, e.g.,
+`--use_turbo_swiglu False` to the launcher. The tables below were measured before these defaults.
+
 ## Reference
 
 Measured with `amdprimus/amdprimus:tas-20261019` and Primus-Turbo 85e85e70, MBS 4 (one micro-batch of
