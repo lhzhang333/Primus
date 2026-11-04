@@ -116,6 +116,12 @@ moe_router_force_load_balancing_type: "even"
 # Leave it on for plain pretraining / SFT, where the logits only feed this loss.
 te_ce_overwrite_input: true
 
+# ===== Word-embedding weight gradient =====
+# Add the word-embedding gradient straight into main_grad (index_add_ of the batch's rows) instead of
+# letting autograd build a dense [vocab, hidden] gradient that DDP then adds in. Applies at TP 1 without
+# reduce-scattered embeddings, untied embedding / output weights, no MTP and not in deterministic mode.
+embedding_wgrad_into_main_grad: false
+
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
 # master barely moves (improves MXFP4 training convergence). Requires
