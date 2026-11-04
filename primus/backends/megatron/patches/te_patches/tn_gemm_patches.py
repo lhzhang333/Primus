@@ -111,7 +111,6 @@ def _make_general_gemm(original, dgrad_tn, hipkittens, transposed, wgrad_hk=Fals
             not args
             and type(A) in (torch.Tensor, torch.nn.Parameter)
             and type(B) is torch.Tensor
-            and A.dim() == 2
             and A.dtype == torch.bfloat16
             and B.dtype == torch.bfloat16
             and A.is_cuda
@@ -119,17 +118,17 @@ def _make_general_gemm(original, dgrad_tn, hipkittens, transposed, wgrad_hk=Fals
             and _plain(kwargs)
         ):
             layout = kwargs.get("layout", "TN")
-            if (
-                layout == "NT"
-                and nt is not None
-                and kwargs.get("grad", False)
-                and B.dim() == 2
-                and nt[2](A.shape[1], B.shape[1], A.shape[0]) is not None
-                and nt[1](A, B)
-            ):
+            if layout == "NT" and nt is not None and kwargs.get("grad", False) and B.is_contiguous():
                 # dw [out, in] = dy^T @ x: HipKittens NT on x [tokens, in] and dy [tokens, out] as they are
-                return nt[0](A, B), None, None, None
-            if layout == "NN" and dgrad_tn and kwargs.get("grad", False):
+                # (Linear passes them with their leading dimensions, LayerNormLinear flattened)
+                x, dy = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
+                if (
+                    x.shape[0] == dy.shape[0]
+                    and nt[2](x.shape[1], dy.shape[1], x.shape[0]) is not None
+                    and nt[1](x, dy)
+                ):
+                    return nt[0](x, dy), None, None, None
+            if layout == "NN" and dgrad_tn and kwargs.get("grad", False) and A.dim() == 2:
                 # With HipKittens, only the shapes it takes go TN; the others keep TE's NN call (and the
                 # example's tuned hipBLASLt rows for it), without a transpose.
                 if hk_dgrad is not None and hk[2](A.shape[1], B.numel() // B.shape[-1], A.shape[0]) is None:

@@ -76,13 +76,21 @@ def test_dgrad_matches_te(out_f, in_f, tokens, hipkittens):
     assert transposes == ([] if refused else [(out_f, in_f)])
 
 
-@pytest.mark.parametrize("out_f,in_f", [(7168, 4096), (16384 // 2, 7168), (1536, 7168)])
-def test_wgrad_matches_te(out_f, in_f):
+@pytest.mark.parametrize(
+    "out_f,in_f,lead",
+    [
+        (7168, 4096, (8192,)),
+        (16384 // 2, 7168, (8192,)),
+        (1536, 7168, (8192,)),  # HipKittens refuses (too few tiles): TE's NT call
+        (7168, 16384, (4096, 2)),  # x and dy with leading [seq, batch] dims, as TE Linear passes them
+    ],
+)
+def test_wgrad_matches_te(out_f, in_f, lead):
     original = _te_gemm()
     _hk()
     gemm = _make(original, False, False, True)
-    x = _ints(8192, in_f, seed=3)
-    dy = _ints(8192, out_f, seed=4)
+    x = _ints(*lead, in_f, seed=3)
+    dy = _ints(*lead, out_f, seed=4)
     ref = original(x, dy, layout="NT", grad=True, out_dtype=torch.bfloat16)
     out = gemm(x, dy, layout="NT", grad=True, out_dtype=torch.bfloat16)
     assert out[0].shape == (out_f, in_f) and all(o is None for o in out[1:])
