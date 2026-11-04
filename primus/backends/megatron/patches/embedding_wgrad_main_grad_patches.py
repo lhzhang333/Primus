@@ -16,7 +16,8 @@ embeddings, no GTP, not deterministic mode, weight not shared with the output la
 autograd function whose backward sums the gradient rows of each distinct token in FP32, adds them
 into ``weight.main_grad`` with ``index_add_``, sets ``grad_added_to_main_grad`` and returns an
 uninitialized dummy -- the contract Megatron's gradient-accumulation fusion uses, so DDP's hook skips
-its add. Without ``main_grad`` (the weight is not wrapped by DDP) the function returns the usual dense
+its add. The sums run in one Triton pass over the sorted ids (``_triton/embedding_wgrad.py``), with no
+host sync. Without ``main_grad`` (the weight is not wrapped by DDP) the function returns the usual dense
 gradient. The forward is unchanged; the gradient differs from the default path only in summation
 order (rows of a repeated token are summed in FP32 before the one BF16 rounding of the add).
 """
@@ -41,6 +42,10 @@ def _make_function():
     import torch
     import torch.nn.functional as F
 
+    from primus.backends.megatron.core.extensions._triton.embedding_wgrad import (
+        embedding_wgrad_into_main_grad,
+    )
+
     class EmbeddingWgradIntoMainGrad(torch.autograd.Function):
         """``F.embedding(ids, weight)`` whose weight gradient goes straight into ``weight.main_grad``."""
 
@@ -60,12 +65,7 @@ def _make_function():
             if main_grad is None or not hasattr(weight, "grad_added_to_main_grad"):
                 dense = torch.ops.aten.embedding_dense_backward(grad_output, ids, weight.shape[0], -1, False)
                 return None, dense
-            flat_ids = ids.reshape(-1)
-            grad = grad_output.reshape(-1, grad_output.shape[-1])
-            uniq, inverse = torch.unique(flat_ids, return_inverse=True)
-            rows = torch.zeros((uniq.numel(), grad.shape[1]), dtype=torch.float32, device=grad.device)
-            rows.index_add_(0, inverse, grad.float())
-            main_grad.index_add_(0, uniq, rows.to(main_grad.dtype))
+            embedding_wgrad_into_main_grad(main_grad, ids, grad_output)
             weight.grad_added_to_main_grad = True
             # Megatron's gradient-accumulation fusion hands autograd a dummy of the weight's shape so the
             # DDP hook still runs (on the main backward thread) and, seeing the flag, skips its add.
