@@ -82,6 +82,8 @@ masked_softmax_fusion: true
 no_persist_layer_norm: false
 bias_dropout_fusion: true
 apply_rope_fusion: true
+# packed-QKV RoPE without a split: q / k / v and the packed dQKV come from one fused call
+fused_single_qkv_rope: false
 
 # miscellaneous
 clone_scatter_output_in_embedding: true

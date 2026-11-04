@@ -55,6 +55,10 @@ use_turbo_fused_qk_rmsnorm_rope: false
 # instead of Megatron's torch.compile ones; other calls keep Megatron's.
 use_turbo_swiglu: false
 
+# fused_single_qkv_rope (packed QKV RoPE without a split) on Primus-Turbo's FlyDSL kernels instead
+# of Transformer Engine's, for the inputs they take; needs fused_single_qkv_rope: true.
+use_turbo_fused_qkv_rope: false
+
 # ===== Parallel Linear =====
 # operator switch
 # use turbo gemm

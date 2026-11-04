@@ -549,6 +549,7 @@ models:
 | `no_persist_layer_norm` | `false` | Non-persistent LayerNorm mode in TE. |
 | `bias_dropout_fusion` | `true` | Fuse bias + dropout. |
 | `apply_rope_fusion` | `true` | Fused RoPE kernels. |
+| `fused_single_qkv_rope` | `false` | Megatron's single fused QKV RoPE: self attention keeps the packed QKV unsplit and one call returns q / k rotated and v, its backward writing the packed dQKV (no split, query reshape copy, per-tensor RoPE or concatenation of dq / dk / dv). Transformer Engine's `apply_fused_qkv_rotary_pos_emb` unless `use_turbo_fused_qkv_rope`. |
 
 ### 10.5 Multi-latent attention (MLA)
 
@@ -642,6 +643,7 @@ models:
 | `turbo_sync_free_moe_stage` | `0` | Stage selector for sync-free MoE. |
 | `use_turbo_fused_act_with_probs` | `false` | Fuse activation + probability tensors to remove redundant work. |
 | `use_turbo_rms_norm` | `false` | Turbo RMSNorm kernels. |
+| `use_turbo_fused_qkv_rope` | `false` | With `fused_single_qkv_rope`, run the fused QKV RoPE on Primus-Turbo's FlyDSL kernels (`primus_turbo.pytorch.ops.rope.fused_qkv_rope`) for the inputs they take (bf16, contiguous, head dim 128, q a whole number of heads per group); other calls keep Transformer Engine's. |
 | `use_turbo_swiglu` | `false` | Dense MLP SwiGLU (the bias-free `bias_swiglu_impl` calls of `bias_activation_fusion`) on Primus-Turbo's elementwise kernels instead of Megatron's `torch.compile` ones; needs a Primus-Turbo with `primus_turbo.pytorch.ops.swiglu`. Calls with a bias, an FP8 input store or CPU offload keep Megatron's. |
 
 ### 11.3 Zero-bubble pipeline (`zero_bubble.yaml`)
