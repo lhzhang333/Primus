@@ -138,3 +138,61 @@ def test_iteration_transposer(monkeypatch):
     args.curr_iteration = 1
     t1 = transposed(w)
     assert t1.data_ptr() == t0.data_ptr() and torch.equal(t1, w.t())
+
+
+def _main_grad(out_f, in_f, seed):
+    """An integer BF16 [out_f, in_f] slice of a larger buffer, 128 bytes into it (a gradient buffer aligns
+    parameters to 64 elements, not 256 bytes)."""
+    buf = torch.zeros(out_f * in_f + 128, dtype=torch.bfloat16, device="cuda")
+    view = buf[64 : 64 + out_f * in_f].view(out_f, in_f)
+    view.copy_(_ints(out_f, in_f, seed=seed) * 16)
+    return buf, view
+
+
+@pytest.mark.parametrize(
+    "out_f,in_f,lead",
+    [
+        (7168, 4096, (8192,)),
+        (7168, 16384, (4096, 2)),
+        (1536, 7168, (8192,)),  # HipKittens refuses (too few tiles): TE's accumulating NT call
+    ],
+)
+def test_wgrad_into_main_grad_matches_te(out_f, in_f, lead):
+    """Gradient-accumulation fusion: TE's wgrad GEMM adds into main_grad (out=main_grad, accumulate=True)."""
+    original = _te_gemm()
+    g = _hk()
+    if not hasattr(g, "hk_gemm_nt_out_ok"):
+        pytest.skip("this Primus-Turbo's NT kernel does not accumulate")
+    gemm = _make(original, False, False, True)
+    x = _ints(*lead, in_f, seed=7)
+    dy = _ints(*lead, out_f, seed=8)
+    _, ref = _main_grad(out_f, in_f, seed=9)
+    buf, main_grad = _main_grad(out_f, in_f, seed=9)
+    kwargs = dict(layout="NT", grad=True, out_dtype=torch.bfloat16, accumulate=True)
+    original(x, dy, out=ref, **kwargs)
+    out = gemm(x, dy, out=main_grad, **kwargs)
+    assert out[0] is main_grad and all(o is None for o in out[1:])
+    assert torch.equal(main_grad, ref)
+    assert buf[:64].count_nonzero() == 0 and buf[64 + main_grad.numel() :].count_nonzero() == 0
+
+
+def test_wgrad_into_main_grad_other_cases_pass_through():
+    _hk()
+    calls = []
+
+    def original(A, B, *args, **kwargs):
+        calls.append(kwargs)
+        return "te", None, None, None
+
+    gemm = _make(original, False, False, True)
+    x = _ints(8192, 4096, seed=10)
+    dy = _ints(8192, 7168, seed=11)
+    fp32_grad = torch.zeros(7168, 4096, device="cuda", dtype=torch.float32)
+    bf16_grad = torch.zeros(7168, 4096, device="cuda", dtype=torch.bfloat16)
+    for kwargs in (
+        dict(out=fp32_grad, out_dtype=torch.float32, accumulate=True),  # FP32 main_grad
+        dict(out=bf16_grad, out_dtype=torch.bfloat16, accumulate=False),  # overwrite, not accumulate
+        dict(out=bf16_grad, out_dtype=torch.bfloat16, accumulate=True, bias=torch.zeros(7168, device="cuda")),
+    ):
+        assert gemm(x, dy, layout="NT", grad=True, **kwargs)[0] == "te"
+    assert len(calls) == 3

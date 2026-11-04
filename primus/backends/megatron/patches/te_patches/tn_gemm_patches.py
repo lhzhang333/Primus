@@ -25,11 +25,15 @@ as fast there or faster, while the dgrad shapes without tuned rows are where Hip
 GEMMs (``dw = dy^T @ x``, layout NT) on HipKittens' NT kernel where it takes the shape: it reads ``x``
 [tokens, in] and ``dy`` [tokens, out] as they are (K-major LDS panels, transposing LDS reads), where the
 hipBLASLt NT kernels are well behind its TN ones on gfx1250. The other wgrad shapes keep TE's NT call.
+Under gradient-accumulation fusion TE has the wgrad GEMM add into ``main_grad`` (``out=main_grad``,
+``accumulate=True``); with a Primus-Turbo whose NT kernel accumulates (``hk_gemm_nt_out_ok``) those
+calls run on it too (one rounding of the FP32 sum, as TE's GEMM with beta = 1).
 
 Only calls with nothing else attached qualify: BF16 2-D weight, no quantization, no Userbuffers
-overlap, no extra output, no accumulation, no GELU, no bias, default alpha/beta. Every other call is
-passed through unchanged. The products are the same in exact arithmetic; the kernel and its summation
-order change.
+overlap, no extra output, no GELU, no bias, default alpha/beta, and no output buffer or accumulation
+except a BF16 ``main_grad`` accumulated into by a weight-gradient GEMM. Every other call is passed
+through unchanged. The products are the same in exact arithmetic; the kernel and its summation order
+change.
 """
 
 from primus.core.patches import PatchContext, get_args, register_patch
@@ -54,21 +58,28 @@ def _enabled(ctx: PatchContext) -> bool:
     ) and _is_gfx1250()
 
 
-def _plain(kwargs) -> bool:
+def _plain(kwargs, into=False) -> bool:
+    """A BF16 GEMM with nothing attached; ``into``: one that accumulates into a given ``out``
+    (``accumulate=True``), otherwise one with neither."""
+    import torch
+
+    if into:
+        target = kwargs.get("accumulate", False) and isinstance(kwargs.get("out"), torch.Tensor)
+    else:
+        target = not kwargs.get("accumulate", False) and kwargs.get("out") is None
     return (
-        kwargs.get("quantization_params") is None
+        target
+        and kwargs.get("quantization_params") is None
         and kwargs.get("ub") is None
         and kwargs.get("ub_type") is None
         and kwargs.get("extra_output") is None
         and not kwargs.get("bulk_overlap", False)
-        and not kwargs.get("accumulate", False)
         and not kwargs.get("gelu", False)
         and kwargs.get("gelu_in") is None
         and kwargs.get("bias") is None
-        and kwargs.get("out") is None
         and kwargs.get("alpha", 1.0) == 1.0
         and kwargs.get("beta") is None
-        and kwargs.get("out_dtype") in (None, __import__("torch").bfloat16)
+        and kwargs.get("out_dtype") in (None, torch.bfloat16)
     )
 
 
@@ -93,8 +104,27 @@ def _make_general_gemm(original, dgrad_tn, hipkittens, transposed, wgrad_hk=Fals
         )
 
         nt = (hk_gemm_nt, hk_gemm_nt_supported, hk_gemm_nt_plan)
+    try:  # a Primus-Turbo whose NT kernel accumulates into its output
+        from primus_turbo.hipkittens.gemm_gfx1250 import hk_gemm_nt_out_ok
+    except ImportError:
+        hk_gemm_nt_out_ok = None
+    nt_into = nt is not None and hk_gemm_nt_out_ok is not None
 
     hk_dgrad = hk
+
+    def wgrad_nt(A, B, kwargs, into):
+        """dw [out, in] = dy^T @ x (added into ``out`` when ``into``) on HipKittens NT, on x [tokens, in] and dy
+        [tokens, out] as they are (Linear passes them with their leading dimensions, LayerNormLinear
+        flattened); None if it does not take the shape."""
+        x, dy = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
+        if not (x.shape[0] == dy.shape[0] and nt[2](x.shape[1], dy.shape[1], x.shape[0]) is not None and nt[1](x, dy)):
+            return None
+        if not into:
+            return nt[0](x, dy), None, None, None
+        out = kwargs["out"]
+        if not hk_gemm_nt_out_ok(out, x, dy, accumulate=True):
+            return None
+        return nt[0](x, dy, out=out, accumulate=True), None, None, None
 
     def tn(A, B, kwargs):
         """D = B @ A^T for a [M, K] A and a [..., K] B, on HipKittens (dgrad) when it takes the shape."""
@@ -115,20 +145,16 @@ def _make_general_gemm(original, dgrad_tn, hipkittens, transposed, wgrad_hk=Fals
             and B.dtype == torch.bfloat16
             and A.is_cuda
             and A.is_contiguous()
-            and _plain(kwargs)
         ):
             layout = kwargs.get("layout", "TN")
+            plain = _plain(kwargs)
             if layout == "NT" and nt is not None and kwargs.get("grad", False) and B.is_contiguous():
-                # dw [out, in] = dy^T @ x: HipKittens NT on x [tokens, in] and dy [tokens, out] as they are
-                # (Linear passes them with their leading dimensions, LayerNormLinear flattened)
-                x, dy = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
-                if (
-                    x.shape[0] == dy.shape[0]
-                    and nt[2](x.shape[1], dy.shape[1], x.shape[0]) is not None
-                    and nt[1](x, dy)
-                ):
-                    return nt[0](x, dy), None, None, None
-            if layout == "NN" and dgrad_tn and kwargs.get("grad", False) and A.dim() == 2:
+                into = not plain and nt_into and _plain(kwargs, into=True)
+                if plain or into:
+                    done = wgrad_nt(A, B, kwargs, into)
+                    if done is not None:
+                        return done
+            if plain and layout == "NN" and dgrad_tn and kwargs.get("grad", False) and A.dim() == 2:
                 # With HipKittens, only the shapes it takes go TN; the others keep TE's NN call (and the
                 # example's tuned hipBLASLt rows for it), without a transpose.
                 if hk_dgrad is not None and hk[2](A.shape[1], B.numel() // B.shape[-1], A.shape[0]) is None:
@@ -188,5 +214,6 @@ def patch_te_tn_gemm(ctx: PatchContext) -> None:
         patched.append(name.rsplit(".", 1)[-1])
     log_rank_0(
         f"[Patch:{_PATCH_KEY}] dgrad TN={dgrad_tn} HipKittens dgrad={hipkittens} HipKittens wgrad={wgrad_hk} "
+        f"(into main_grad: {wgrad_hk and hasattr(gemm_gfx1250, 'hk_gemm_nt_out_ok')}) "
         f"in: {', '.join(patched) or 'none'}"
     )
