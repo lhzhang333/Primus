@@ -89,12 +89,21 @@ like the DeepSeek-V3 example's; see hipBLASLt tuning in its README.
 `use_turbo_swiglu` (the MLP's SwiGLU on Primus-Turbo's elementwise kernels; a Primus-Turbo without
 `primus_turbo.pytorch.ops.swiglu` keeps Megatron's `torch.compile` kernels and logs a warning),
 `fused_single_qkv_rope` with `use_turbo_fused_qkv_rope` (the packed QKV goes through one RoPE call on
-Primus-Turbo's FlyDSL kernels instead of a split, a query copy, RoPE per tensor and a concatenation of
-the gradients), `use_turbo_cross_entropy` with `turbo_ce_overwrite_input` (Primus-Turbo's cross entropy,
+Primus-Turbo's fused QKV RoPE kernels instead of a split, a query copy, RoPE per tensor and a
+concatenation of the gradients; a Primus-Turbo with the Triton backend runs it on gfx1250, where its
+backward also reads the attention's gradients in place, and `PRIMUS_TURBO_ROPE_BACKEND=FLYDSL` picks the
+FlyDSL kernels), `use_turbo_cross_entropy` with `turbo_ce_overwrite_input` (Primus-Turbo's cross entropy,
 whose backward writes the logits' gradient over the logits), `create_attention_mask_in_dataloader:
-false` (causal attention takes no mask, so the data loader builds none), and `te_dgrad_transposed_weight`
+false` (causal attention takes no mask, so the data loader builds none), `te_dgrad_transposed_weight`
 (Transformer Engine's dgrad GEMMs run as TN on a transposed copy of the weight, which hipBLASLt runs
-faster on gfx1250; the tuning file below has rows for those shapes). On gfx1250, Primus also checks
+faster on gfx1250; the tuning file below has rows for those shapes), `grad_buffer_first_write`
+(DDP's backward hook copies each parameter's first gradient of a step into the gradient buffer instead
+of adding it, so with one micro-batch per step the next step skips clearing the buffer; it uses
+Primus-Turbo's gradient-ownership log, which checks before each bucket's reduction that every skipped
+slice was overwritten), and `use_precision_aware_optimizer` with Megatron's defaults for it (FP32
+gradients and moments; the FP32 master weights are kept exactly, as int16 remainders of the BF16
+parameters, so the Adam step updates the BF16 parameters in place, without a separate FP32 -> BF16
+copy, and the optimizer state is 2 bytes per parameter smaller). On gfx1250, Primus also checks
 the NaN / Inf validations of a step with one host sync (`defer_nan_check`) and folds gradient clipping
 into the Triton Adam step (`fold_clip_into_adam`). Any of them can be turned off by appending, e.g.,
 `--use_turbo_swiglu False` to the launcher. The tables below were measured before these defaults.

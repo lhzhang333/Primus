@@ -88,13 +88,23 @@ modules:
       use_turbo_rms_norm: true
       # MLP SwiGLU on Primus-Turbo's kernels (a Primus-Turbo without them keeps Megatron's)
       use_turbo_swiglu: true
-      # packed-QKV RoPE without a split, on Primus-Turbo's FlyDSL kernels
+      # packed-QKV RoPE without a split, on Primus-Turbo's fused QKV RoPE kernels (Triton on gfx1250;
+      # PRIMUS_TURBO_ROPE_BACKEND=FLYDSL picks its FlyDSL ones)
       fused_single_qkv_rope: true
       use_turbo_fused_qkv_rope: true
 
       # dgrad GEMMs as TN on a transposed weight (hipBLASLt runs TN faster on gfx1250; the tuning file
       # in examples/megatron/models/llama3.1-8b/hipblaslt_tuning/ has rows for those shapes)
       te_dgrad_transposed_weight: true
+
+      # DDP's backward hook copies each parameter's first gradient of a step into the gradient buffer
+      # instead of adding it; with one micro-batch per step the next step skips clearing the buffer
+      grad_buffer_first_write: true
+
+      # precision-aware optimizer with Megatron's defaults (FP32 gradients and moments, FP32 master
+      # weights kept as int16 remainders of the BF16 params): the Triton param-remainder Adam updates
+      # the BF16 params in place, without the FP32 -> BF16 copy pass, in a few batched launches
+      use_precision_aware_optimizer: true
 
       # cross entropy: Primus-Turbo's, its backward overwriting the logits with their gradient
       cross_entropy_fusion_impl: "te"
