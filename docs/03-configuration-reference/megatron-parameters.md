@@ -642,6 +642,7 @@ models:
 | `turbo_sync_free_moe_stage` | `0` | Stage selector for sync-free MoE. |
 | `use_turbo_fused_act_with_probs` | `false` | Fuse activation + probability tensors to remove redundant work. |
 | `use_turbo_rms_norm` | `false` | Turbo RMSNorm kernels. |
+| `use_turbo_swiglu` | `false` | Dense MLP SwiGLU (the bias-free `bias_swiglu_impl` calls of `bias_activation_fusion`) on Primus-Turbo's elementwise kernels instead of Megatron's `torch.compile` ones; needs a Primus-Turbo with `primus_turbo.pytorch.ops.swiglu`. Calls with a bias, an FP8 input store or CPU offload keep Megatron's. |
 
 ### 11.3 Zero-bubble pipeline (`zero_bubble.yaml`)
 
