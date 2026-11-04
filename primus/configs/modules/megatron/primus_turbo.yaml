@@ -50,6 +50,11 @@ enable_turbo_attention_float8: false
 # not qualify keep the Megatron path.
 use_turbo_fused_qk_rmsnorm_rope: false
 
+# ===== Activation =====
+# Dense MLP SwiGLU (bias-free bias_swiglu_impl calls) on Primus-Turbo's elementwise kernels
+# instead of Megatron's torch.compile ones; other calls keep Megatron's.
+use_turbo_swiglu: false
+
 # ===== Parallel Linear =====
 # operator switch
 # use turbo gemm
