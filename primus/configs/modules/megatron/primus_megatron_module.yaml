@@ -122,6 +122,17 @@ te_ce_overwrite_input: true
 # reduce-scattered embeddings, untied embedding / output weights, no MTP and not in deterministic mode.
 embedding_wgrad_into_main_grad: false
 
+# ===== TE GEMM layouts (gfx1250) =====
+# Run TE Linear / LayerNormLinear dgrad (dx = dy @ w, layout NN) as TN on a transposed copy of the
+# weight made once per training iteration.
+te_dgrad_tn: false
+# Run the TN dgrad above on Primus-Turbo's HipKittens gfx1250 kernels where they take the shape; the
+# other dgrad shapes keep TE's NN call (hipBLASLt). Needs te_dgrad_tn.
+te_gemm_hipkittens: false
+# Run TE Linear / LayerNormLinear weight-gradient GEMMs (dw = dy^T @ x, layout NT) on the HipKittens NT
+# kernel where it takes the shape, on x and dy as they are (hipBLASLt elsewhere).
+te_wgrad_hipkittens: false
+
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
 # master barely moves (improves MXFP4 training convergence). Requires
