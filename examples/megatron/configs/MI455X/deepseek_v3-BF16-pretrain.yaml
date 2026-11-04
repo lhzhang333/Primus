@@ -128,3 +128,7 @@ modules:
       # writes the BF16 gradient over the logits in one pass (TE's keeps an FP32 gradient copy)
       use_turbo_cross_entropy: true
       turbo_ce_overwrite_input: true
+
+      # word embedding: add the weight gradient straight into main_grad (no dense [vocab, hidden]
+      # gradient per micro-batch)
+      embedding_wgrad_into_main_grad: true
