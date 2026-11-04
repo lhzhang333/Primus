@@ -124,3 +124,7 @@ modules:
       # cross entropy
       cross_entropy_fusion_impl: "te"
       cross_entropy_loss_fusion: true
+      # Primus-Turbo's cross entropy: the forward keeps only each row's log-sum-exp, the backward
+      # writes the BF16 gradient over the logits in one pass (TE's keeps an FP32 gradient copy)
+      use_turbo_cross_entropy: true
+      turbo_ce_overwrite_input: true
