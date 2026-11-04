@@ -12,7 +12,9 @@ all tensors of a dtype: program ``i`` scales ``BLOCK`` elements of one tensor, f
 table that is built once per tensor list (the gradient buffers do not move between steps) and cached.
 
 Each product is taken in fp32 and rounded once to the tensor's dtype, as ``multi_tensor_scale`` does, so
-the results are bit for bit the same.
+the results are bit for bit the same. A coefficient of exactly 1, which gradient clipping passes as a device
+tensor whenever the norm is under the limit, moves no memory (``x * 1`` is ``x``), without the host having to
+read the coefficient.
 """
 
 from typing import Dict, List, Tuple, Union
@@ -41,7 +43,9 @@ def _multi_tensor_scale_kernel(
     else:
         c = coeff
     offs = start + tl.arange(0, BLOCK).to(tl.int64)
-    mask = offs < n
+    # a coefficient of exactly 1 (clipping's clamp when the norm is under the limit) leaves every value as it
+    # is: move nothing
+    mask = (offs < n) & (c != 1.0)
     x = tl.load(base + offs, mask=mask).to(tl.float32)
     tl.store(base + offs, (x * c).to(DTYPE), mask=mask)
 

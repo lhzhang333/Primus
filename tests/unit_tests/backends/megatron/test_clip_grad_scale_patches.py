@@ -101,3 +101,32 @@ def test_patch_installs_once(monkeypatch):
     assert patched._primus_triton_scale and optimizer_module.clip_grad_by_total_norm_fp32 is patched
     mod.patch_clip_grad_triton_scale(None)
     assert clip_grads.clip_grad_by_total_norm_fp32 is patched
+
+
+def test_device_coefficient_of_one_moves_nothing():
+    """Clipping under the limit hands the kernel a device coefficient of exactly 1: the values stay bit for bit
+    and the pass reads and writes nothing (much faster than a real scale over the same tensors)."""
+    from primus.backends.megatron.core.extensions._triton.multi_tensor_scale import multi_tensor_scale_
+
+    g = torch.Generator(device="cuda").manual_seed(7)
+    tensors = [torch.randn(n, device="cuda", generator=g).to(torch.bfloat16) for n in (1 << 26, 3 << 24, 12345)]
+    ref = [t.clone() for t in tensors]
+    one = torch.ones((), device="cuda")
+    multi_tensor_scale_(tensors, one)
+    assert all(torch.equal(t, r) for t, r in zip(tensors, ref))
+
+    def timed(coeff):
+        multi_tensor_scale_(tensors, coeff)
+        torch.cuda.synchronize()
+        st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        st.record()
+        for _ in range(10):
+            multi_tensor_scale_(tensors, coeff)
+        en.record()
+        torch.cuda.synchronize()
+        return st.elapsed_time(en)
+
+    assert timed(one) < 0.5 * timed(torch.full((), 0.999, device="cuda"))
+    # a NaN coefficient still poisons the gradients, as a multiply would
+    multi_tensor_scale_(tensors, torch.full((), float("nan"), device="cuda"))
+    assert all(torch.isnan(t.float()).all() for t in tensors)
