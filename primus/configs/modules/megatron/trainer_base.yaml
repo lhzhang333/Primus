@@ -380,9 +380,10 @@ exp_avg_sq_dtype: fp32 # 'fp32', 'fp16', 'fp8'
 # int16 remainders) runs on Triton too; other precision-aware, capturable and FP8
 # paths fall back to TE. Set false to keep TE FusedAdam.
 use_triton_fused_adam: true
-# gfx1250 only: with the precision-aware optimizer's param remainders, the Triton step applies the
-# global-norm clip coefficient as it reads the gradients instead of after a separate scaling pass
-# over them (bit for bit the same update). Off, or another architecture: keep the separate pass.
+# gfx1250 only: the Triton Adam step (its FP32-state path for fp32 gradients, and the
+# precision-aware optimizer's param remainders) applies the global-norm clip coefficient as it
+# reads the gradients instead of after a separate scaling pass over them (bit for bit the same
+# update). Off, or another architecture: keep the separate pass.
 fold_clip_into_adam: true
 
 # Check a step's fatal NaN/Inf validations (check_for_nan_in_loss_and_grad) of losses and gradient

@@ -19,7 +19,10 @@ unchanged. Two paths are replaced:
   grads, non-FP32 states, FP8/DTensor params, grad scaler, closure and groups
   without bias correction use the TE step. Individual gradients the kernels
   cannot take (dtype, layout) are updated by torch's functional Adam in the
-  same step.
+  same step. On gfx1250 it takes the global-norm clip coefficient as it reads
+  each fp32 gradient (``deferred_clip``), bit for bit the update after
+  Megatron's separate scaling pass; other gradients are scaled first, as that
+  pass would scale them.
 - the precision-aware optimizer's param-remainder path (bf16 params whose FP32
   master weights are int16 remainders, bf16 or fp32 moments): bit for bit TE's
   ``multi_tensor_adam_param_remainder``, and it takes the global-norm clip
@@ -83,8 +86,9 @@ class TritonFusedAdam(FusedAdam):
 
     def _mark_folding(self):
         # Megatron's distributed optimizer swaps in its shard params after construction (then
-        # reloads the state dict): mark whatever the groups hold now
-        if self._remainder_enabled:
+        # reloads the state dict): mark whatever the groups hold now. Both Triton paths take the
+        # deferred clip coefficient (the plain FP32-state one validated on gfx1250 only).
+        if self._remainder_enabled or (self._triton_enabled and is_gfx1250()):
             deferred_clip.mark_folding(p for group in self.param_groups for p in group["params"])
 
     def load_state_dict(self, state_dict):
@@ -224,6 +228,10 @@ class TritonFusedAdam(FusedAdam):
                 (p for group in self.param_groups for p in group["params"]), self.use_decoupled_grad
             )
         if not self._use_triton(closure, grad_scaler):
+            # TE's step: scale the gradients by any clip coefficient deferred to them first
+            deferred_clip.apply_eagerly(
+                (p for group in self.param_groups for p in group["params"]), self.use_decoupled_grad
+            )
             return super().step(closure=closure, grad_scaler=grad_scaler)
 
         for group_idx, group in enumerate(self.param_groups):
@@ -243,31 +251,43 @@ class TritonFusedAdam(FusedAdam):
             )
             batches, launches, leftovers = defaultdict(list), defaultdict(int), []
 
-            def launch(dtypes):
-                tensors, rows = zip(*batches.pop(dtypes))
-                cache = self._batch_tables[(group_idx, dtypes, launches[dtypes])]
-                triton_multi_tensor_adam_step_(list(tensors), rows=list(rows), cache=cache, **hparams)
-                launches[dtypes] += 1
+            # a batch: one dtype combination and one deferred clip coefficient (or none)
+            def launch(key):
+                tensors, rows = zip(*batches.pop(key))
+                dtypes, coeff = key
+                cache = self._batch_tables[(group_idx, dtypes, coeff is not None, launches[key])]
+                triton_multi_tensor_adam_step_(
+                    list(tensors), rows=list(rows), cache=cache, grad_scale=coeff, **hparams
+                )
+                launches[key] += 1
 
             for p in group["params"]:
                 grad = p.grad
                 if grad is None:
                     continue
+                coeff = deferred_clip.take(p)
                 entry = self._entry(p)
                 if entry is None or not triton_supports(grad) or grad.numel() != entry[2]:
+                    if coeff is not None:
+                        deferred_clip.scale(grad, coeff)
                     leftovers.append(p)
                     continue
+                if coeff is not None and grad.dtype != torch.float32:
+                    # bit for bit the separate scaling only for fp32 gradients: behind a rounding to
+                    # a narrower dtype the compiler may contract the moment update differently
+                    deferred_clip.scale(grad, coeff)
+                    coeff = None
                 m, v, numel, batchable, (pd, md, vd), (pa, ma, va) = entry
                 tensors = (p, grad, m, v)
                 if batchable and is_batchable((grad,)):
-                    dtypes = (pd, grad.dtype, md, vd)
-                    batches[dtypes].append((tensors, [pa, grad.data_ptr(), ma, va, numel]))
-                    if len(batches[dtypes]) == _TENSORS_PER_BATCHED_LAUNCH:
-                        launch(dtypes)
+                    key = ((pd, grad.dtype, md, vd), coeff)
+                    batches[key].append((tensors, [pa, grad.data_ptr(), ma, va, numel]))
+                    if len(batches[key]) == _TENSORS_PER_BATCHED_LAUNCH:
+                        launch(key)
                 else:
-                    triton_adam_step_(*tensors, grid_size=self.grid_size, **hparams)
-            for dtypes in list(batches):
-                launch(dtypes)
+                    triton_adam_step_(*tensors, grid_size=self.grid_size, grad_scale=coeff, **hparams)
+            for key in list(batches):
+                launch(key)
             if leftovers:
                 self._torch_step(group, leftovers, bool(self.adam_w_mode))
         return None

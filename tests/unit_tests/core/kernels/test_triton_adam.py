@@ -116,3 +116,32 @@ def test_bf16_params_with_fp32_states():
     ref_p, _, _ = _reference(p0.float(), g.float(), 1, True)
     assert p.dtype == torch.bfloat16
     torch.testing.assert_close(p.float(), ref_p, rtol=1.6e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("grad_dtype", [torch.float32])
+@pytest.mark.parametrize("batched", [False, True])
+def test_grad_scale_matches_separate_scaling(grad_dtype, batched):
+    """grad_scale gives bit for bit the update of an in-place `grad *= scale` pass before the step,
+    and leaves the gradient untouched. FP32 gradients only: with a bf16 rounding of the scaled
+    gradient in front of it, the per-tensor kernel's moment update may contract to FMA differently
+    (last-bit differences), so TritonFusedAdam scales non-fp32 gradients first."""
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    p0 = torch.randn(70_001, device="cuda", generator=gen)
+    g0 = (torch.randn(70_001, device="cuda", generator=gen) * 3).to(grad_dtype)
+    scale = torch.tensor([0.37], device="cuda")
+    # reference: Megatron's clip scales the gradient in place (TE multi_tensor_scale: fp32 product,
+    # rounded once to nearest even), then steps. Not torch's bf16 `mul_`, which on ROCm rounds ties
+    # of that product away from even.
+    p_ref, m_ref, v_ref = _fresh(p0)
+    g_ref = (g0.float() * scale).to(grad_dtype)
+    p, m, v = _fresh(p0)
+    g = g0.clone()
+    for step in (1, 2):
+        if batched:
+            ta.triton_multi_tensor_adam_step_([(p_ref, g_ref, m_ref, v_ref)], step=step, **HP)
+            ta.triton_multi_tensor_adam_step_([(p, g, m, v)], step=step, grad_scale=scale, **HP)
+        else:
+            ta.triton_adam_step_(p_ref, g_ref, m_ref, v_ref, step=step, **HP)
+            ta.triton_adam_step_(p, g, m, v, step=step, grad_scale=scale, **HP)
+    assert torch.equal(p, p_ref) and torch.equal(m, m_ref) and torch.equal(v, v_ref)
+    assert torch.equal(g, g0)

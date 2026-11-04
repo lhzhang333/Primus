@@ -85,12 +85,17 @@ def _adam_kernel(
     weight_decay,
     bias_correction1,
     bias_correction2,
+    grad_scale_ptr,
     ADAM_W_MODE: tl.constexpr,
+    HAS_GRAD_SCALE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
     stride = tl.num_programs(0).to(tl.int64) * BLOCK_SIZE
     block_start = pid * BLOCK_SIZE
+    grad_scale = 1.0
+    if HAS_GRAD_SCALE:
+        grad_scale = tl.load(grad_scale_ptr)
     while block_start < n_elements:
         offs = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
         mask = offs < n_elements
@@ -99,6 +104,9 @@ def _adam_kernel(
         g = tl.load(g_ptr + offs, mask=mask).to(tl.float32)
         m = tl.load(m_ptr + offs, mask=mask).to(tl.float32)
         v = tl.load(v_ptr + offs, mask=mask).to(tl.float32)
+        if HAS_GRAD_SCALE:
+            # the gradient a separate in-place `grad *= scale` (fp32 product, one rounding) leaves
+            g = (g * grad_scale).to(g_ptr.dtype.element_ty).to(tl.float32)
         p, m, v = _adam_update(
             p, g, m, v, lr, beta1, beta2, eps, weight_decay, bias_correction1, bias_correction2, ADAM_W_MODE
         )
@@ -121,12 +129,14 @@ def _adam_multi_tensor_kernel(
     weight_decay,
     bias_correction1,
     bias_correction2,
+    grad_scale_ptr,
     P_DTYPE: tl.constexpr,
     G_DTYPE: tl.constexpr,
     M_DTYPE: tl.constexpr,
     V_DTYPE: tl.constexpr,
     ALIGN: tl.constexpr,
     ADAM_W_MODE: tl.constexpr,
+    HAS_GRAD_SCALE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CHUNK_BLOCKS: tl.constexpr,
 ):
@@ -139,6 +149,9 @@ def _adam_multi_tensor_kernel(
     v_ptr = tl.multiple_of(tl.load(row + 3).to(tl.pointer_type(V_DTYPE)), ALIGN)
     n_elements = tl.load(row + 4)
     chunk_start = tl.load(chunk_local_ptr + chunk).to(tl.int64) * (CHUNK_BLOCKS * BLOCK_SIZE)
+    grad_scale = 1.0
+    if HAS_GRAD_SCALE:
+        grad_scale = tl.load(grad_scale_ptr)
 
     for i in tl.static_range(CHUNK_BLOCKS):
         offs = chunk_start + i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -147,6 +160,8 @@ def _adam_multi_tensor_kernel(
         g = tl.load(g_ptr + offs, mask=mask).to(tl.float32)
         m = tl.load(m_ptr + offs, mask=mask).to(tl.float32)
         v = tl.load(v_ptr + offs, mask=mask).to(tl.float32)
+        if HAS_GRAD_SCALE:
+            g = (g * grad_scale).to(G_DTYPE).to(tl.float32)
         p, m, v = _adam_update(
             p, g, m, v, lr, beta1, beta2, eps, weight_decay, bias_correction1, bias_correction2, ADAM_W_MODE
         )
@@ -372,8 +387,12 @@ def triton_adam_step_(
     bias_correction: bool = True,
     adam_w_mode: bool = True,
     grid_size: int = 0,
+    grad_scale: torch.Tensor = None,
 ) -> None:
-    """In-place Adam/AdamW update of one tensor, matching TE ``multi_tensor_adam`` math."""
+    """In-place Adam/AdamW update of one tensor, matching TE ``multi_tensor_adam`` math.
+
+    ``grad_scale`` (a one-element fp32 tensor on the device) updates with the gradient a separate
+    in-place ``grad *= grad_scale`` would leave, without that pass; the gradient is not modified."""
     n_elements = param.numel()
     if n_elements == 0:
         return
@@ -393,7 +412,9 @@ def triton_adam_step_(
         weight_decay,
         bias_correction1,
         bias_correction2,
+        grad_scale if grad_scale is not None else grad,
         ADAM_W_MODE=bool(adam_w_mode),
+        HAS_GRAD_SCALE=grad_scale is not None,
         BLOCK_SIZE=_BLOCK_SIZE,
     )
 
@@ -426,8 +447,11 @@ def triton_multi_tensor_adam_step_(
     adam_w_mode: bool = True,
     cache: dict = None,
     rows: list = None,
+    grad_scale: torch.Tensor = None,
 ) -> None:
     """In-place Adam/AdamW update of many ``(param, grad, exp_avg, exp_avg_sq)`` tuples in one launch.
+
+    ``grad_scale``: as in :func:`triton_adam_step_`, for all of them.
 
     All tuples must share the same dtype per slot, be contiguous, non-empty and
     ``_MULTI_TENSOR_ALIGN_BYTES``-aligned. ``cache`` keeps the device tables
@@ -457,12 +481,14 @@ def triton_multi_tensor_adam_step_(
         weight_decay,
         bias_correction1,
         bias_correction2,
+        grad_scale if grad_scale is not None else tables[0],
         P_DTYPE=_TL_DTYPES[p.dtype],
         G_DTYPE=_TL_DTYPES[g.dtype],
         M_DTYPE=_TL_DTYPES[m.dtype],
         V_DTYPE=_TL_DTYPES[v.dtype],
         ALIGN=_MULTI_TENSOR_ALIGN_BYTES,
         ADAM_W_MODE=bool(adam_w_mode),
+        HAS_GRAD_SCALE=grad_scale is not None,
         BLOCK_SIZE=_MULTI_TENSOR_BLOCK_SIZE,
         CHUNK_BLOCKS=_MULTI_TENSOR_CHUNK_BLOCKS,
         num_warps=_MULTI_TENSOR_NUM_WARPS,

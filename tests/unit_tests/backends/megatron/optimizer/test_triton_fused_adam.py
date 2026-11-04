@@ -254,3 +254,86 @@ def test_patch_keeps_te_when_fused_adam_clip_is_installed():
         assert optimizer_module.Adam is orig_adam
     finally:
         getattr(FusedAdam, _SENTINEL_ATTR).discard(clip_key)
+
+
+def _clip_pair(fold, closure_step=False):
+    """Two TritonFusedAdam runs on the same grads: a deferred clip coefficient vs scaling first."""
+    from primus.backends.megatron.core.optimizer import deferred_clip
+
+    saved = deferred_clip.ENABLED
+    deferred_clip.ENABLED = True
+    try:
+        ref_params = _make_params(torch.float32)
+        tri_params = [torch.nn.Parameter(p.detach().clone()) for p in ref_params]
+        ref = TritonFusedAdam(ref_params, **HPARAMS)
+        tri = TritonFusedAdam(tri_params, **HPARAMS)
+        coeff = torch.tensor([0.25], device="cuda")
+        for step in range(3):
+            _set_grads(ref_params, tri_params, step)
+            for p in ref_params:
+                p.grad.mul_(coeff)
+            ref.step()
+            deferred = deferred_clip.defer(tri_params, coeff) if fold else False
+            if closure_step:
+                tri.step(closure=lambda: None)
+            else:
+                tri.step()
+            assert all(deferred_clip.take(p) is None for p in tri_params)
+        torch.cuda.synchronize()
+        return deferred, ref_params, tri_params
+    finally:
+        deferred_clip.ENABLED = saved
+
+
+def test_deferred_clip_folded_bitwise():
+    from primus.core.utils.gpu_arch import is_gfx1250
+
+    deferred, ref_params, tri_params = _clip_pair(fold=True)
+    # the plain FP32-state step folds the coefficient on gfx1250 only
+    assert deferred == is_gfx1250()
+    for a, b in zip(ref_params, tri_params):
+        assert torch.equal(a, b)
+
+
+def test_deferred_clip_applied_before_te_step():
+    """A step that leaves Triton (here: a closure) still scales by the deferred coefficient first."""
+    from primus.core.utils.gpu_arch import is_gfx1250
+
+    if not is_gfx1250():
+        pytest.skip("the coefficient is only deferred on gfx1250")
+    deferred, ref_params, tri_params = _clip_pair(fold=True, closure_step=True)
+    assert deferred
+    for a, b in zip(ref_params, tri_params):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)  # TE's kernel vs Triton's
+
+
+def test_deferred_clip_bf16_grads_scaled_first():
+    """bf16 gradients take a deferred coefficient through an exact scaling pass (TE's rounding) before
+    the step, so the update is bit for bit the one after Megatron's separate clip pass."""
+    from primus.backends.megatron.core.optimizer import deferred_clip
+    from primus.core.utils.gpu_arch import is_gfx1250
+
+    if not is_gfx1250():
+        pytest.skip("the coefficient is only deferred on gfx1250")
+    saved = deferred_clip.ENABLED
+    deferred_clip.ENABLED = True
+    try:
+        ref_params = _make_params(torch.bfloat16)
+        tri_params = [torch.nn.Parameter(p.detach().clone()) for p in ref_params]
+        ref = TritonFusedAdam(ref_params, **HPARAMS)
+        tri = TritonFusedAdam(tri_params, **HPARAMS)
+        coeff = torch.tensor([0.37], device="cuda")
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        for _ in range(2):
+            for pa, pb in zip(ref_params, tri_params):
+                g = (torch.randn(pa.shape, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+                pa.grad = (g.float() * coeff).to(torch.bfloat16)  # TE multi_tensor_scale's rounding
+                pb.grad = g.clone()
+            ref.step()
+            assert deferred_clip.defer(tri_params, coeff)
+            tri.step()
+        torch.cuda.synchronize()
+        for a, b in zip(ref_params, tri_params):
+            assert torch.equal(a, b)
+    finally:
+        deferred_clip.ENABLED = saved
