@@ -10,7 +10,14 @@ Primus MoE All-to-All dispatcher D2H patch.
 Patches ``MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize`` so that when
 ``use_turbo_grouped_gemm`` is enabled, ``tokens_per_expert`` is kept on-device
 (PrimusTurbo grouped gemm consumes it on the GPU) instead of being copied to the
-host. All other splits are still moved to CPU and the stream sync is unchanged.
+host. All other splits are still moved to CPU at the same point.
+
+The host waits for those copies at the sync point only when there was a copy to wait
+for. Without expert or tensor parallelism, dropless and with the fused permute (the
+single-GPU case), every split is either None or a host value already, so no copy is
+made and the wait would only stall the host until the GPU drained its queue: the host
+then has to refill it kernel by kernel, leaving the GPU idle between the small routing
+and permute kernels.
 """
 
 import torch
@@ -44,6 +51,12 @@ def patch_moe_alltoall_dtoh(ctx: PatchContext):
         if not self.drop_and_pad:
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
+                pending = [self.input_splits, self.output_splits, self.output_splits_tp, self.num_out_tokens]
+                if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
+                    pending.append(self.num_global_tokens_per_local_expert)
+                self._primus_dtoh_copied = any(torch.is_tensor(t) and t.is_cuda for t in pending)
+                if not self._primus_dtoh_copied:
+                    return tokens_per_expert
                 on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
                 if on_side_stream:
                     self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
@@ -71,8 +84,8 @@ def patch_moe_alltoall_dtoh(ctx: PatchContext):
                         )
                 self.d2h_event = self.cuda_dtoh_stream.record_event()
 
-            if point == self.cuda_sync_point:
-                # Synchronize with the DtoH stream at self.cuda_sync_point.
+            if point == self.cuda_sync_point and getattr(self, "_primus_dtoh_copied", True):
+                # Synchronize with the DtoH stream at self.cuda_sync_point, when there was a copy.
                 self.d2h_event.synchronize()
 
         return tokens_per_expert
