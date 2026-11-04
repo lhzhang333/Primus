@@ -120,6 +120,9 @@ modules:
       turbo_sync_free_moe_stage: 1
       moe_use_fused_router_with_aux_score: true
       moe_permute_fusion: true
+      # experts' SwiGLU x routing probs in Primus-Turbo's fused kernels (forward and backward, rows past the
+      # tokens_per_expert counts masked) instead of the compiled WeightedSwiGLUFunction
+      use_turbo_fused_act_with_probs: true
 
       # cross entropy
       cross_entropy_fusion_impl: "te"
