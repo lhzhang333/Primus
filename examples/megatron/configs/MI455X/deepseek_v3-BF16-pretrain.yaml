@@ -132,3 +132,8 @@ modules:
       # word embedding: add the weight gradient straight into main_grad (no dense [vocab, hidden]
       # gradient per micro-batch)
       embedding_wgrad_into_main_grad: true
+
+      # TE dgrad GEMMs as TN on per-iteration transposed weights, on Primus-Turbo's HipKittens kernels
+      # where they fill the GPU (hipBLASLt's NN kernels are well behind on gfx1250)
+      te_dgrad_tn: true
+      te_gemm_hipkittens: true
