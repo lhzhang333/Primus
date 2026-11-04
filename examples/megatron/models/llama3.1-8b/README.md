@@ -76,7 +76,9 @@ variable. The patch needs root and stays in a long-lived container; set
 **hipBLASLt tuning.** The launcher sets `HIPBLASLT_TUNING_OVERRIDE_FILE` to
 `hipblaslt_tuning/llama3.1_8b-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt` (empty: hipBLASLt's own
 choice), which gives 11 of the 15 hipBLASLt GEMM shapes (4 x 8192 tokens per micro-batch) a faster kernel of
-hipBLASLt's library, e.g. FC1 forward 1.32x and the output layer forward 1.36x. Other hipBLASLt builds and
+hipBLASLt's library, e.g. FC1 forward 1.32x and the output layer forward 1.36x, and has rows for the three TN
+dgrad shapes `te_dgrad_transposed_weight` adds (FC1, FC2, QKV; the out-projection's TN dgrad has the shape of
+its forward, already in the file). Other hipBLASLt builds and
 shapes (another `MBS` x sequence length, or `PRIMUS_TP`) fall back to hipBLASLt's default. A file of your own
 may be given relative to the current directory; the launcher checks that it can be read and mounts it into
 the container. With Primus's own tuning flow (`PRIMUS_HIPBLASLT_TUNING=1`, see `examples/README.md`) the
@@ -89,8 +91,10 @@ like the DeepSeek-V3 example's; see hipBLASLt tuning in its README.
 `fused_single_qkv_rope` with `use_turbo_fused_qkv_rope` (the packed QKV goes through one RoPE call on
 Primus-Turbo's FlyDSL kernels instead of a split, a query copy, RoPE per tensor and a concatenation of
 the gradients), `use_turbo_cross_entropy` with `turbo_ce_overwrite_input` (Primus-Turbo's cross entropy,
-whose backward writes the logits' gradient over the logits), and `create_attention_mask_in_dataloader:
-false` (causal attention takes no mask, so the data loader builds none). On gfx1250, Primus also checks
+whose backward writes the logits' gradient over the logits), `create_attention_mask_in_dataloader:
+false` (causal attention takes no mask, so the data loader builds none), and `te_dgrad_transposed_weight`
+(Transformer Engine's dgrad GEMMs run as TN on a transposed copy of the weight, which hipBLASLt runs
+faster on gfx1250; the tuning file below has rows for those shapes). On gfx1250, Primus also checks
 the NaN / Inf validations of a step with one host sync (`defer_nan_check`) and folds gradient clipping
 into the Triton Adam step (`fold_clip_into_adam`). Any of them can be turned off by appending, e.g.,
 `--use_turbo_swiglu False` to the launcher. The tables below were measured before these defaults.
