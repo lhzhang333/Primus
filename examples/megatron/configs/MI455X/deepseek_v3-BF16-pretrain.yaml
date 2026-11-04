@@ -73,6 +73,9 @@ modules:
       train_data_path: ${PRIMUS_TOKENIZED_DATA_PATH:null}
       valid_data_path: null
       test_data_path: null
+      # attention is causal by mask type: no [seq, seq] boolean mask per sample built on the host and
+      # copied to the GPU every micro-batch
+      create_attention_mask_in_dataloader: false
 
       moe_use_legacy_grouped_gemm: false
       # MLA
