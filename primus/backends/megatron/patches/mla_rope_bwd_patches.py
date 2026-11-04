@@ -8,7 +8,7 @@
 
 Megatron's fused MLA RoPE (``megatron.core.fusions.fused_mla_yarn_rope_apply``) un-rotates the query
 gradient in place with ``rotary_bwd_q_kernel``, which writes the two halves of each rotated pair as two
-stride-2 stores (even, then odd elements). On gfx1250 that kernel takes about twice as long as the forward
+stride-2 stores (even, then odd elements). On gfx1250 that kernel is much slower than the forward
 one, which moves the same data with contiguous stores. ``mla_rope_bwd_contiguous_store: true`` swaps in the
 same kernel with the two halves interleaved in registers (``tl.interleave``) and written in one contiguous
 store per row. The arithmetic is the same; the compiler may contract its multiply-adds differently, so a few
