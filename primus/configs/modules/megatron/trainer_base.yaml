@@ -389,6 +389,10 @@ fold_clip_into_adam: true
 # a transposed copy of the weight instead of NN, which hipBLASLt runs faster there (the TN shapes want
 # their own tuning rows). Off: TE's NN dgrad.
 te_dgrad_transposed_weight: false
+# DDP's backward hook copies each parameter's first gradient of an iteration into main_grad instead of
+# adding it, and the next iteration skips clearing those slices (with one micro-batch per step); needs
+# enable_primus_turbo (Primus-Turbo's grad_ownership log). Off: clear the whole buffer and add.
+grad_buffer_first_write: false
 
 # Check a step's fatal NaN/Inf validations (check_for_nan_in_loss_and_grad) of losses and gradient
 # norms with one host sync, after the backward and before the update, raising upstream's errors.
