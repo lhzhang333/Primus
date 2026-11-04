@@ -132,6 +132,10 @@ te_gemm_hipkittens: false
 # Run TE Linear / LayerNormLinear weight-gradient GEMMs (dw = dy^T @ x, layout NT) on the HipKittens NT
 # kernel where it takes the shape, on x and dy as they are (hipBLASLt elsewhere).
 te_wgrad_hipkittens: false
+# Run the output layer's (LM head, Megatron ColumnParallelLinear) backward GEMMs on the HipKittens
+# kernels where they take the shape: dgrad as TN on a per-iteration transposed weight, wgrad as NT on
+# input and grad_output as they are. Plain case only (TP 1, no SP, no bias, no gradient-accumulation fusion).
+output_layer_gemm_hipkittens: false
 
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
