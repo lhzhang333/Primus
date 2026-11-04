@@ -20,7 +20,10 @@ def _function():
     return _make_function()
 
 
-@pytest.mark.parametrize("vocab,hidden,tokens,id_range", [(4096, 1024, 2048, 64), (32000, 2048, 4096, 32000)])
+# More than 3072 looked-up rows: PyTorch's dense backward then sorts the ids and sums each id's rows in
+# FP32 before one rounding, the path every training micro-batch takes (below that it switches to a
+# per-feature kernel that rounds differently, so the comparison would test PyTorch's switch, not this).
+@pytest.mark.parametrize("vocab,hidden,tokens,id_range", [(4096, 1024, 4096, 64), (32000, 2048, 8192, 32000)])
 def test_matches_dense_gradient_plus_ddp_add(vocab, hidden, tokens, id_range):
     fn = _function()
     g = torch.Generator(device="cuda").manual_seed(0)
