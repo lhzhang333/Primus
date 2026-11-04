@@ -76,6 +76,8 @@ modules:
       # attention is causal by mask type: no [seq, seq] boolean mask per sample built on the host and
       # copied to the GPU every micro-batch
       create_attention_mask_in_dataloader: false
+      # each micro-batch's host-to-device copies on a side stream, not queued behind the previous backward
+      batch_h2d_side_stream: true
 
       moe_use_legacy_grouped_gemm: false
       # MLA

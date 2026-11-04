@@ -144,6 +144,8 @@ clip_grad_triton_scale: false
 # MLA YaRN RoPE query backward (Megatron's fused kernel) with one contiguous store per row instead of two
 # stride-2 stores. Same arithmetic; a differently contracted multiply-add can round a few elements apart.
 mla_rope_bwd_contiguous_store: false
+# copy each micro-batch to the GPU on a side stream instead of behind the previous micro-batch's kernels
+batch_h2d_side_stream: false
 
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
