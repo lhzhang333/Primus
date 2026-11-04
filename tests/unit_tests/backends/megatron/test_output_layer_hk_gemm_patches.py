@@ -93,6 +93,51 @@ def test_random_data_close_to_megatron():
         assert err < 1e-2
 
 
+def test_into_main_grad_matches_megatron_bitwise():
+    """Gradient-accumulation fusion: the weight gradient added into a BF16 main_grad (Megatron's
+    wgrad_gemm_accum_fp16), a dummy gradient and the DDP flag, as Megatron's function does."""
+    from megatron.core.tensor_parallel import layers
+
+    from primus.backends.megatron.core.extensions._triton.transpose import transpose_2d
+    from primus.backends.megatron.patches.output_layer_hk_gemm_patches import _make_function
+
+    tn, nt = _hk()
+    from primus_turbo.hipkittens import gemm_gfx1250 as g
+
+    if not hasattr(g, "hk_gemm_nt_out_ok"):
+        pytest.skip("this Primus-Turbo's NT kernel does not accumulate")
+    if not getattr(layers, "_grad_accum_fusion_available", True):
+        pytest.skip("Megatron's fused_weight_gradient_mlp_cuda is unavailable")
+    fn = _make_function(tn, nt, lambda w: transpose_2d(w.detach()), g.hk_gemm_nt_out_ok)
+    gen = torch.Generator(device="cuda").manual_seed(2)
+
+    def ints(*shape):
+        return torch.randint(-2, 3, shape, device="cuda", generator=gen).to(torch.bfloat16)
+
+    seq, hidden, vocab = 4096, 2048, 8320  # the weight gradient: 8 x 32 tiles, a ragged N edge
+    x, w0, gy = ints(seq, 2, hidden), ints(vocab, hidden), ints(seq, 2, vocab)
+    g0 = ints(vocab, hidden) * 16
+    assert nt[1](hidden, vocab, 2 * seq) is not None
+
+    def run(f):
+        xi = x.clone().requires_grad_(True)
+        w = torch.nn.Parameter(w0.clone())
+        buf = torch.zeros(w.numel() + 128, dtype=torch.bfloat16, device="cuda")  # 128 bytes into a buffer
+        w.main_grad = buf[64 : 64 + w.numel()].view(w.shape)
+        w.main_grad.copy_(g0)
+        w.grad_added_to_main_grad = False
+        y = f(xi, w)
+        y.backward(gy)
+        return y.detach(), xi.grad, w.main_grad, w.grad, w.grad_added_to_main_grad
+
+    ref = run(lambda xi, w: layers.linear_with_grad_accumulation_and_async_allreduce(
+        xi, w, None, True, False, False, None, None, None, 1))
+    out = run(lambda xi, w: fn.apply(xi, w, True))
+    for name, a, r in zip(("output", "grad_input", "main_grad"), out[:3], ref[:3]):
+        assert torch.equal(a, r), name
+    assert out[3].shape == ref[3].shape == (vocab, hidden) and out[4] is True and ref[4] is True
+
+
 def test_wrapper_keeps_megatron_for_other_cases(monkeypatch):
     _hk()
     from megatron.core.tensor_parallel import layers
@@ -142,6 +187,20 @@ def test_wrapper_keeps_megatron_for_other_cases(monkeypatch):
     # the plain case goes to the HipKittens-backward function
     y = patched(x, w, None, False, False, False, None, None, None, 1)
     assert isinstance(y, torch.Tensor) and y.shape == (4, 2, 16) and len(calls) == 8
+    # under gradient-accumulation fusion, an FP32 main_grad and a shape HipKittens does not take stay with
+    # Megatron; a BF16 main_grad at a shape it takes does not
+    w.main_grad = torch.zeros(16, 8, device="cuda", dtype=torch.float32)
+    assert patched(x, w, None, True, False, False, None, None, None, 1) == "megatron"
+    w.main_grad = torch.zeros(16, 8, device="cuda", dtype=torch.bfloat16)
+    assert patched(x, w, None, True, False, False, None, None, None, 1) == "megatron"
+    big_x = torch.zeros(4096, 2, 2048, device="cuda", dtype=torch.bfloat16)
+    big_w = torch.nn.Parameter(torch.zeros(8320, 2048, device="cuda", dtype=torch.bfloat16))
+    big_w.main_grad = torch.zeros(8320, 2048, device="cuda", dtype=torch.bfloat16)
+    from primus_turbo.hipkittens import gemm_gfx1250 as g
+
+    y = patched(big_x, big_w, None, True, False, False, None, None, None, 1)
+    assert (y == "megatron") != hasattr(g, "hk_gemm_nt_out_ok")
+    assert len(calls) == (10 if hasattr(g, "hk_gemm_nt_out_ok") else 11)
     # applying the patch again keeps the one wrapper
     mod.patch_output_layer_gemm_hipkittens(None)
     assert layers.linear_with_grad_accumulation_and_async_allreduce is patched
