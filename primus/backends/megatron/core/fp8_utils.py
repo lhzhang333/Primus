@@ -169,6 +169,12 @@ if HAVE_TE and HAVE_TURBO:
 
         return fp8_quant_config, fp8_quant_config_none_reason
 
+    def _te_mxfp8_unsupported(config: TransformerConfig) -> bool:
+        """MXFP8 on gfx1250: TE's recipe asserts there, Primus-Turbo's quantization does not."""
+        from primus.core.utils.gpu_arch import is_gfx1250
+
+        return config.fp8_recipe == Fp8Recipe.mxfp8 and is_gfx1250()
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
 
@@ -209,6 +215,11 @@ if HAVE_TE and HAVE_TURBO:
                     warning_rank_0(
                         f"Primus-Turbo FP8 {config.fp8_recipe} not work since Primus-Turbo not support fp8 model init."
                     )
+                if fp8_quant_config is not None and _te_mxfp8_unsupported(config):
+                    warning_rank_0(
+                        "MXFP8 on gfx1250: TransformerEngine's autocast stays off; Primus-Turbo modules "
+                        "quantize, TransformerEngine modules run BF16."
+                    )
                 WARN_ONCE = False
 
             fp8_group = None
@@ -222,8 +233,13 @@ if HAVE_TE and HAVE_TURBO:
                     primus_turbo_fp8_autocast,
                 )
 
+                te_enabled = fp8_recipe is not None
+                if te_enabled and fp8_quant_config is not None and _te_mxfp8_unsupported(config):
+                    # TE's MXFP8 recipe asserts on gfx1250: only Primus-Turbo quantizes (the use_turbo_gemm /
+                    # use_turbo_grouped_gemm modules), TE's own modules run BF16.
+                    te_enabled = False
                 fp8_context = primus_turbo_fp8_autocast(
-                    enabled=True if fp8_recipe is not None else False,
+                    enabled=te_enabled,
                     fp8_recipe=fp8_recipe,
                     fp8_group=fp8_group,
                     enabled_turbo=True if fp8_quant_config is not None else False,

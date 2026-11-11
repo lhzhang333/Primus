@@ -1,0 +1,44 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+#
+# Per-module precision of the DeepSeek-V3 MXFP8 proxy on MI455X: routed experts MXFP8, dense linears BF16.
+# Loaded as te_precision_config_file (Megatron --te-precision-config-file) under the global Primus-Turbo
+# MXFP8 recipe (--fp8 e4m3 --fp8_recipe mxfp8, see run_deepseek_v3_proxy_mi455x.sh PRIMUS_MXFP8=experts).
+# A matched module with an empty training_recipe runs BF16; the routed experts
+# (decoder.layers.N.mlp.experts.linear_fc1 / fc2) match nothing and keep the global recipe. The LM head
+# (output_layer) is a Megatron linear and stays BF16 in every recipe.
+#
+# This file is not a Primus experiment recipe.
+###############################################################################
+
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+
+matchers:
+  # MLA: linear_q_down_proj, linear_q_up_proj, linear_kv_down_proj, linear_kv_up_proj, linear_proj
+  mla_linears_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.self_attention.linear_*"
+    enabled: true
+  shared_experts_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.mlp.shared_experts.linear_fc*"
+    enabled: true
+  # the full model's dense FFN layers (not the routed experts: *.mlp.experts.linear_fc*)
+  dense_mlp_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.mlp.linear_fc*"
+    enabled: true
+  mtp_eh_proj_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.eh_proj"
+    enabled: true

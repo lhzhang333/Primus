@@ -68,6 +68,19 @@ if [[ -n "${PRIMUS_TURBO_GROUPED_GEMM_BACKEND:-}" ]]; then
     echo "set TURBO_GROUPED_GEMM_BACKEND instead of PRIMUS_TURBO_GROUPED_GEMM_BACKEND" >&2
     exit 2
 fi
+# MXFP8 training (E4M3 data, an E8M0 scale per 32 along each GEMM's reduction dim), quantized by Primus-Turbo
+# (TransformerEngine's autocast stays off on gfx1250): empty or off; experts: the routed experts (the dense
+# linears stay BF16 on TransformerEngine); dense: the MLA and shared-expert linears (on Primus-Turbo, routed
+# experts BF16); dense_experts: both. The LM head stays BF16. The per-module BF16 overrides are the
+# te_precision_config_file matchers of configs/MI455X/deepseek_v3-MXFP8-bf16-*.yaml.
+export PRIMUS_MXFP8=${PRIMUS_MXFP8:-}
+case "${PRIMUS_MXFP8,,}" in
+    "" | off | experts | dense | dense_experts) ;;
+    *)
+        echo "PRIMUS_MXFP8 must be empty, off, experts, dense or dense_experts, not '${PRIMUS_MXFP8}'" >&2
+        exit 2
+        ;;
+esac
 export MOCK_DATA=${MOCK_DATA:-True}
 export PROFILE=${PROFILE:-False}
 # 1: bind each rank's CPU threads and host memory to the NUMA node of its GPU (a little faster)
@@ -189,6 +202,20 @@ if [[ "${ENABLE_NUMA_BINDING}" == 1 ]]; then
     RUNNER_ARGS+=(--numa)
 fi
 
+MX_CONFIGS=${PWD}/examples/megatron/configs/MI455X
+MXFP8_ARGS=()
+case "${PRIMUS_MXFP8,,}" in
+    experts) MXFP8_ARGS=(--te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-dense.yaml") ;;
+    dense) MXFP8_ARGS=(--use_turbo_gemm True --te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-experts.yaml") ;;
+    dense_experts) MXFP8_ARGS=(--use_turbo_gemm True) ;;
+esac
+if [[ ${#MXFP8_ARGS[@]} -gt 0 ]]; then
+    # the unfused grouped MLP (fc1 -> SwiGLU -> fc2), no TE zero-padding of the expert groups
+    MXFP8_ARGS+=(--fp8 e4m3 --fp8_recipe mxfp8 --turbo_fused_grouped_gemm False
+        --turbo_grouped_gemm_without_padding True)
+    ENV_ARGS+=(--env NVTE_ROCM_ENABLE_MXFP8=1)
+fi
+
 if [[ -n "${PRIMUS_RECOMPUTE_LAYER_IDS}" ]]; then
     # as a list: Primus reads a single id as an int
     RECOMPUTE_ARGS=(--recompute_granularity full --recompute_layer_ids "[${PRIMUS_RECOMPUTE_LAYER_IDS//[][]/}]")
@@ -219,4 +246,5 @@ mkdir -p "${LOG_DIR}"
     --use_pytorch_profiler "${PROFILE}" \
     --profile_step_start 6 \
     --profile_step_end 8 \
+    "${MXFP8_ARGS[@]}" \
     "$@" 2>&1 | tee "${LOG_DIR}/train.log"
