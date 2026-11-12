@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import os
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
@@ -505,6 +506,42 @@ def _fuse_wgrad_accum_pattern(config, weight: torch.Tensor) -> Optional[str]:
     return "megatron"
 
 
+def _mx_weight_gemm_layout(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> bool:
+    """Whether cached quantized weights of ``quant_config`` are kept in the GEMM layout: MXFP8 on gfx1250, whose
+    FlyDSL GEMMs read E8M0 scales packed as ``[rows/32][K/128][32][4]`` (``shuffle_scale``) and B operands in
+    16x16-preshuffled tiles (``shuffle_out``), for W and its transpose alike."""
+    return (
+        isinstance(quant_config, Float8QuantConfig)
+        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
+        and _is_gfx1250()
+    )
+
+
+def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+    """Scaling recipe of both copies of a cached quantized weight (Primus-Turbo's choice, except
+    :func:`_mx_weight_gemm_layout`)."""
+    if isinstance(quant_config, Float4QuantConfig):
+        return ScalingRecipe(
+            use_2d_block=True,
+            shuffle_scale=quant_config.use_preshuffle,
+            shuffle_out=quant_config.use_preshuffle,
+        )
+    if _mx_weight_gemm_layout(quant_config):
+        return ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
+    if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+        return ScalingRecipe(use_2d_block=True)
+    return ScalingRecipe()
+
+
+@lru_cache(maxsize=None)
+def _takes_scaling_recipe(fn) -> bool:
+    """Whether Primus-Turbo's ``create_quantized_weight`` takes a ``scaling_recipe`` (newer builds)."""
+    try:
+        return "scaling_recipe" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _maybe_create_quantized_weight_buffers(
     weight: torch.Tensor,
     dest_dtype: torch.dtype,
@@ -515,7 +552,10 @@ def _maybe_create_quantized_weight_buffers(
     (colwise) buffer, returning ``(rowwise, colwise_or_None)``.
 
     Prefers primus_turbo's ``create_quantized_weight`` helper, which picks the
-    scaling recipe from the quant config and handles per-granularity transpose.
+    scaling recipe from the quant config and handles per-granularity transpose;
+    for the GEMM layout of :func:`_mx_weight_gemm_layout` it is handed
+    :func:`_weight_scaling_recipe` when it takes a ``scaling_recipe`` (one that
+    does not keeps its default layout, which that build's GEMMs read).
     Falls back to a manual rowwise/colwise quantize on older primus_turbo builds
     that do not export ``create_quantized_weight`` yet.
     """
@@ -523,31 +563,20 @@ def _maybe_create_quantized_weight_buffers(
     need_weight_transpose_cache = not disable_parameter_transpose_cache
 
     if create_quantized_weight is not None:
+        kwargs = {}
+        if _mx_weight_gemm_layout(quant_config_internal) and _takes_scaling_recipe(create_quantized_weight):
+            kwargs["scaling_recipe"] = _weight_scaling_recipe(quant_config_internal)
         return create_quantized_weight(
             weight,
             dest_dtype,
             quant_config_internal,
             need_weight_transpose_cache=need_weight_transpose_cache,
+            **kwargs,
         )
 
     # TODO(ruibin): Remove this fallback path once create_quantized_weight is
     # always available in the shipped primus_turbo build.
-    def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
-        if isinstance(quant_config, Float4QuantConfig):
-            weight_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
-                shuffle_scale=quant_config.use_preshuffle,
-                shuffle_out=quant_config.use_preshuffle,
-            )
-
-        if isinstance(quant_config, Float8QuantConfig):
-            if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
-                weight_scaling_recipe = ScalingRecipe(use_2d_block=True)
-            else:
-                weight_scaling_recipe = ScalingRecipe()
-
-        return weight_scaling_recipe
-
+    quant_config = quant_config_internal  # granularity / block_size / the recipe live on the Turbo config
     quantized_weight_rowwise = PrimusTurboQuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,
