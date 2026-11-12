@@ -1,8 +1,9 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Cached MXFP8 weights on gfx1250 are requested in the FlyDSL GEMM layout (E8M0 scales packed, codes 16x16
-preshuffled); other architectures and recipes keep Primus-Turbo's default recipe."""
+"""Cached MXFP8 weights on gfx1250 take the layout Primus-Turbo's ``mx_weight_layout_recipe(grouped)`` reports for
+the op kind (dense for a 2-D weight, grouped for the 3-D expert stack); other architectures and recipes, and a
+Primus-Turbo without the query, keep Turbo's default recipe."""
 
 import pytest
 import torch
@@ -10,6 +11,8 @@ import torch
 from tests.utils import skip_if_no_cuda
 
 skip_if_no_cuda()
+
+import primus_turbo.pytorch as primus_turbo_torch  # noqa: E402  isort:skip
 
 import primus.backends.megatron.core.extensions.primus_turbo as primus_turbo_ext  # noqa: E402  isort:skip
 from primus.backends.megatron.core.extensions.primus_turbo import (  # noqa: E402  isort:skip
@@ -32,14 +35,12 @@ MXFP8 = PrimusTurboQuantConfig(
 BLOCKWISE = PrimusTurboQuantConfig(granularity=ScalingGranularity.BLOCKWISE, block_size=128)
 TENSORWISE = PrimusTurboQuantConfig()
 GEMM_LAYOUT = ScalingRecipe(use_2d_block=True, shuffle_scale=True, shuffle_out=True)
+RAW = ScalingRecipe(use_2d_block=True)
 
 
-@pytest.mark.parametrize("gfx1250", [True, False])
-def test_weight_scaling_recipe(monkeypatch, gfx1250):
-    monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: gfx1250)
-    expected_mx = GEMM_LAYOUT if gfx1250 else ScalingRecipe(use_2d_block=True)
-    assert _weight_scaling_recipe(MXFP8.data()) == expected_mx
-    assert _weight_scaling_recipe(BLOCKWISE.data()) == ScalingRecipe(use_2d_block=True)
+def test_weight_scaling_recipe_is_turbos_default():
+    assert _weight_scaling_recipe(MXFP8.data()) == RAW
+    assert _weight_scaling_recipe(BLOCKWISE.data()) == RAW
     assert _weight_scaling_recipe(TENSORWISE.data()) == ScalingRecipe()
 
 
@@ -59,27 +60,48 @@ def _recording_create(calls, *, takes_recipe):
     return create
 
 
+def _turbo_layout_query(monkeypatch, *, present):
+    """A Turbo whose dense MX GEMM reads the GEMM layout and whose grouped one does not (yet)."""
+    asked = []
+    if present:
+
+        def mx_weight_layout_recipe(grouped, shape=None):
+            asked.append((grouped, shape))
+            return RAW if grouped else GEMM_LAYOUT
+
+        monkeypatch.setattr(
+            primus_turbo_torch.ops, "mx_weight_layout_recipe", mx_weight_layout_recipe, raising=False
+        )
+    else:
+        monkeypatch.delattr(primus_turbo_torch.ops, "mx_weight_layout_recipe", raising=False)
+    return asked
+
+
 @pytest.mark.parametrize(
-    "gfx1250, config, takes_recipe, expected",
+    "gfx1250, config, query, takes_recipe, shape, expected, asked",
     [
-        (True, MXFP8, True, GEMM_LAYOUT),
-        (False, MXFP8, True, None),  # other archs: Turbo's own recipe, as before
-        (True, BLOCKWISE, True, None),
-        (True, TENSORWISE, True, None),
-        (True, MXFP8, False, "no scaling_recipe argument"),  # an older Turbo keeps its default layout
+        (True, MXFP8, True, True, (64, 64), GEMM_LAYOUT, [(False, (64, 64))]),  # dense linear
+        (True, MXFP8, True, True, (2, 64, 64), RAW, [(True, (2, 64, 64))]),  # grouped linear's expert stack
+        (True, MXFP8, False, True, (64, 64), None, []),  # a Turbo without the query: its default layout
+        (True, MXFP8, True, False, (64, 64), "no scaling_recipe argument", [(False, (64, 64))]),
+        (False, MXFP8, True, True, (64, 64), None, []),  # other archs: unchanged
+        (True, BLOCKWISE, True, True, (64, 64), None, []),
+        (True, TENSORWISE, True, True, (64, 64), None, []),
     ],
 )
-def test_create_quantized_weight_gets_the_gemm_layout_on_gfx1250_only(
-    monkeypatch, gfx1250, config, takes_recipe, expected
+def test_cached_weight_layout_follows_turbos_query(
+    monkeypatch, gfx1250, config, query, takes_recipe, shape, expected, asked
 ):
     monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: gfx1250)
+    asked_now = _turbo_layout_query(monkeypatch, present=query)
     calls = []
     monkeypatch.setattr(
         primus_turbo_ext, "create_quantized_weight", _recording_create(calls, takes_recipe=takes_recipe)
     )
-    weight = torch.zeros(64, 64, dtype=torch.bfloat16)
+    weight = torch.zeros(shape, dtype=torch.bfloat16)
     out = _maybe_create_quantized_weight_buffers(
         weight, float8_e4m3, config, disable_parameter_transpose_cache=False
     )
     assert out == ("rowwise", "colwise")
     assert calls == [expected]
+    assert asked_now == asked
