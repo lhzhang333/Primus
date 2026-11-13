@@ -18,6 +18,7 @@ Patches included:
   - aiter_deepbind_patches: Install the aiter mha RTLD_DEEPBIND isolation hook (gfx942/gfx950)
     so the Turbo attention backward binds the pinned aiter::mha_bwd, not TE's stale libmha
   - dense_mlp_fp4_patches: Route dense SwiGLU MLP through FlyDSL dense MXFP4 mlp_fp4
+  - dense_mlp_mxfp8_patches: Route the non-expert SwiGLU MLPs (DeepSeek-V3 shared experts) through MXFP8 mlp_fp8
   - fused_qkv_rope_patches: Route Megatron fused packed-QKV RoPE through FlyDSL fused_qkv_rope
   - qk_rmsnorm_rope_patches: Fuse GPT-OSS packed QKV, Q/K RMSNorm and RoPE with FlyDSL
 

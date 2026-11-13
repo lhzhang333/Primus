@@ -55,7 +55,9 @@ use_turbo_fused_qk_rmsnorm_rope: false
 # use turbo gemm
 use_turbo_gemm: false
 # Fuse the dense SwiGLU MLP chain (fc1 + GLU + fc2) into Primus-Turbo's
-# FlyDSL MXFP4 dense MLP op. Analog of turbo_fused_grouped_gemm for G=1.
+# FlyDSL dense MLP op: MXFP4 mlp_fp4 under fp4, MXFP8 mlp_fp8 (the non-expert
+# MLPs, e.g. DeepSeek-V3's shared experts) under --fp8 e4m3 --fp8_recipe mxfp8.
+# Analog of turbo_fused_grouped_gemm for G=1.
 # Default off; Llama-3.1-8B opts in from the experiment YAML.
 turbo_fused_gemm: false
 
