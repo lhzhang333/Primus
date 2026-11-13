@@ -118,6 +118,10 @@ from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import warning_rank_0
 
 _dummy_wgrads = {}
+try:  # one set of dummy wgrad buffers per process, shared with Primus-Turbo's GEMMs (see _get_dummy_wgrad)
+    from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad as _turbo_get_dummy_wgrad
+except ImportError:
+    _turbo_get_dummy_wgrad = None
 
 # A fused RMSNorm producer attaches raw MXFP4 buffers to its (deliberately
 # unwritten) BF16 autograd carrier. The next ColumnParallelLinear consumes the
@@ -339,7 +343,14 @@ def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tenso
     grouped-linear weights ``(num_gemms, out_features, in_features)``, etc.).
     Tensors are cached by ``(shape, dtype)`` so each distinct weight layout
     only allocates one persistent buffer that gets reused across steps.
+
+    The buffers are Primus-Turbo's own (``primus_turbo.pytorch.ops.utils._get_dummy_wgrad``) when it has
+    them: with wgrad accumulation fused, the Turbo GEMM under :func:`_bridge_weight_grad` already returned a
+    dummy of the same shape and dtype, and a second persistent copy here would double the cost (2.6 GiB per
+    process for DeepSeek-V3's 32-expert stacks). The contents are never read.
     """
+    if _turbo_get_dummy_wgrad is not None:
+        return _turbo_get_dummy_wgrad(list(shape), dtype, zero=zero)
     global _dummy_wgrads
     key = (tuple(shape), dtype)
     if key not in _dummy_wgrads:
@@ -383,6 +394,10 @@ def _bridge_weight_grad(
         @staticmethod
         def forward(ctx, x, weight, quantized_weight, quantized_weight_trans):
             ctx.save_for_backward(weight)
+            # The GEMMs return no gradient for the transpose copy (an operand of their backward only), and
+            # backward ignores it: without this, autograd would hand backward a materialized zero tensor of
+            # the full weight shape for it on every microbatch (1.75 GiB + a memset for a DeepSeek-V3 expert fc1).
+            ctx.set_materialize_grads(False)
             return x, quantized_weight, quantized_weight_trans
 
         @staticmethod
@@ -407,7 +422,9 @@ def _bridge_weight_grad(
                 # the dummy wgrad returned below means they are not recoverable from
                 # param.grad either. The fused path above is immune because its beta=1
                 # epilogue accumulates on every microbatch regardless of the flag.
-                if _is_gfx1250():
+                if grad_quantized_weight is None:  # set_materialize_grads(False): no gradient reached it
+                    pass
+                elif _is_gfx1250():
                     inplace_add_triton_(weight.main_grad, grad_quantized_weight)
                 else:
                     weight.main_grad.add_(grad_quantized_weight)
@@ -548,6 +565,19 @@ def _takes_scaling_recipe(fn) -> bool:
         return False
 
 
+def _not_leaves(*copies):
+    """The cached quantized copies of a weight, as tensors that do not require grad.
+
+    Primus-Turbo's ``create_quantized_weight`` gives them the weight's ``requires_grad``, which makes each an
+    autograd leaf: passing it through :func:`_bridge_weight_grad` then puts an AccumulateGrad node holding it
+    into the graph (the bridge's outputs need no such leaf: they require grad through ``weight``). Megatron's
+    token dispatcher keeps the last microbatch's ``probs`` (and so that graph) until the layer's next forward,
+    so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
+    step's first microbatch: 3 x 2.7 GiB on top of the new caches at the DeepSeek-V3 proxy's allocation peak.
+    """
+    return tuple(c.requires_grad_(False) if c is not None and c.requires_grad else c for c in copies)
+
+
 def _maybe_create_quantized_weight_buffers(
     weight: torch.Tensor,
     dest_dtype: torch.dtype,
@@ -572,12 +602,14 @@ def _maybe_create_quantized_weight_buffers(
         recipe = _mx_weight_layout_recipe(quant_config_internal, weight)
         if recipe is not None and _takes_scaling_recipe(create_quantized_weight):
             kwargs["scaling_recipe"] = recipe
-        return create_quantized_weight(
-            weight,
-            dest_dtype,
-            quant_config_internal,
-            need_weight_transpose_cache=need_weight_transpose_cache,
-            **kwargs,
+        return _not_leaves(
+            *create_quantized_weight(
+                weight,
+                dest_dtype,
+                quant_config_internal,
+                need_weight_transpose_cache=need_weight_transpose_cache,
+                **kwargs,
+            )
         )
 
     # TODO(ruibin): Remove this fallback path once create_quantized_weight is
@@ -620,7 +652,7 @@ def _maybe_create_quantized_weight_buffers(
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
 
-    return quantized_weight_rowwise, quantized_weight_colwise
+    return _not_leaves(quantized_weight_rowwise, quantized_weight_colwise)
 
 
 def _call_fp8_autocast_enter(
@@ -1399,6 +1431,9 @@ class PrimusTurboLinear(TELinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -1448,6 +1483,9 @@ class PrimusTurboLinear(TELinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -1614,6 +1652,9 @@ class PrimusTurboRowParallelLinear(TERowParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -1663,6 +1704,9 @@ class PrimusTurboRowParallelLinear(TERowParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -1828,6 +1872,9 @@ class PrimusTurboColumnParallelLinear(TEColumnParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -1884,6 +1931,9 @@ class PrimusTurboColumnParallelLinear(TEColumnParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -2080,6 +2130,9 @@ class PrimusTurboLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -2142,6 +2195,9 @@ class PrimusTurboLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
                     )
                 else:
                     if is_first_microbatch:
+                        # drop the previous step's copies first: their memory is reused for the new ones (no second
+                        # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                        self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                         (
                             self.quantized_weight_buffer,
                             self.quantized_weight_t_buffer,
@@ -2490,6 +2546,9 @@ class PrimusTurboGroupedLinear(TEGroupedLinear):
             if get_num_microbatches() == 1:
                 return x, weights, fuse_wgrad_accum_pattern
             if is_first_microbatch:
+                # drop the previous step's copies first: their memory is reused for the new ones (no second
+                # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                 (
                     self.quantized_weight_buffer,
                     self.quantized_weight_t_buffer,
@@ -2521,6 +2580,9 @@ class PrimusTurboGroupedLinear(TEGroupedLinear):
                     )
                 return x, weights, fuse_wgrad_accum_pattern
             if is_first_microbatch:
+                # drop the previous step's copies first: their memory is reused for the new ones (no second
+                # set of the weight caches alive while quantizing, which also fragments the caching allocator)
+                self.quantized_weight_buffer = self.quantized_weight_t_buffer = None
                 (
                     self.quantized_weight_buffer,
                     self.quantized_weight_t_buffer,
