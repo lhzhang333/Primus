@@ -287,16 +287,21 @@ def test_experts_pass_the_wgrad_accum_pattern(mega_moe, args, monkeypatch, takes
     assert calls == [("stage1", pattern), ("stage2", pattern)]
 
 
-def test_mxfp8_experts_keep_ddp_wgrad_add(mega_moe, args, monkeypatch):
-    """The mxfp8 stages take no accumulation pattern: the experts must not claim one."""
+@pytest.mark.parametrize("takes_pattern", [True, False], ids=["turbo_takes_the_pattern", "older_turbo"])
+def test_mxfp8_experts_claim_the_pattern_their_stages_take(mega_moe, args, monkeypatch, takes_pattern):
+    """The mxfp8 experts claim ``"megatron"`` only when their own (mxfp8) stages take the argument: a
+    Primus-Turbo whose mxfp8 stages lack it keeps DDP's add, whatever the bf16 stages take."""
     calls = []
-    stage1, stage2 = _stub_stages(calls, takes_pattern=True)
-    monkeypatch.setattr(mega_moe, "fused_mega_moe_stage1", stage1)
-    monkeypatch.setattr(mega_moe, "fused_mega_moe_stage2", stage2)
+    bf16_stages, fp8_stages = _stub_stages(calls, takes_pattern=True), _stub_stages(calls, takes_pattern)
+    monkeypatch.setattr(mega_moe, "fused_mega_moe_stage1", bf16_stages[0])
+    monkeypatch.setattr(mega_moe, "fused_mega_moe_stage2", bf16_stages[1])
+    monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage1", fp8_stages[0])
+    monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage2", fp8_stages[1])
+    monkeypatch.setattr(mega_moe, "_on_gfx1250", lambda: False)  # GLUActivation is a stub here
     args.turbo_mega_moe_wgrad_accum_fusion = True
     mega_moe._turbo_stages_take_wgrad_accum.cache_clear()
     try:
         experts = mega_moe.MegaMoEFP8Experts(_config(), 4, 32, 8, _EPGroup())
     finally:
         mega_moe._turbo_stages_take_wgrad_accum.cache_clear()
-    assert experts.wgrad_accum_pattern is None
+    assert experts.wgrad_accum_pattern == ("megatron" if takes_pattern else None)
