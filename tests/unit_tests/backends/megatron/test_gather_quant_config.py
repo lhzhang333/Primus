@@ -69,6 +69,16 @@ def test_incompatible_consumer_is_rejected(key, value):
         gather.validate_gather_quant_config(config(**{key: value}))
 
 
+def test_mxfp8_consumer_is_accepted():
+    """Turbo's fused grouped MXFP8 MLP (gfx1250) gathers in its quantizer like the MXFP4 one."""
+    mx8 = config(fp4=None, fp4_recipe=None, fp8="e4m3", fp8_recipe="mxfp8")
+    assert gather.validate_gather_quant_config(mx8) == (True, True)
+    with pytest.raises(ValueError, match="fp8_recipe"):
+        gather.validate_gather_quant_config(
+            config(fp4=None, fp4_recipe=None, fp8="e4m3", fp8_recipe="delayed")
+        )
+
+
 def test_backward_requires_forward():
     with pytest.raises(ValueError, match="requires moe_permute_quant_fusion"):
         gather.validate_gather_quant_config(config(moe_permute_quant_fusion=False))
@@ -88,7 +98,7 @@ def test_only_dispatcher_scope_opts_in_and_restores_after_error(monkeypatch, bac
     module = ModuleType("megatron.core.transformer.moe.token_dispatcher")
     module.MoEAlltoAllTokenDispatcher = Dispatcher
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(gather, "_uses_mxfp4", lambda: True)
+    monkeypatch.setattr(gather, "_uses_mx", lambda: True)
     wrapped = gather.configure_gather_quant_fusion(
         config(moe_backward_permute_quant_fusion=backward), permute
     )
@@ -100,5 +110,5 @@ def test_only_dispatcher_scope_opts_in_and_restores_after_error(monkeypatch, bac
     with pytest.raises(RuntimeError, match="test failure"):
         Dispatcher().dispatch_preprocess("raise")
     assert wrapped() == expected_eager
-    monkeypatch.setattr(gather, "_uses_mxfp4", lambda: False)
+    monkeypatch.setattr(gather, "_uses_mx", lambda: False)
     assert Dispatcher().dispatch_preprocess() == expected_eager
