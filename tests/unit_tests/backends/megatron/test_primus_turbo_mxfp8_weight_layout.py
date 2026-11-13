@@ -18,9 +18,11 @@ import primus.backends.megatron.core.extensions.primus_turbo as primus_turbo_ext
 from primus.backends.megatron.core.extensions.primus_turbo import (  # noqa: E402  isort:skip
     Format,
     PrimusTurboQuantConfig,
+    PrimusTurboQuantizedTensorPair,
     ScaleDtype,
     ScalingGranularity,
     ScalingRecipe,
+    _bridge_weight_grad,
     _maybe_create_quantized_weight_buffers,
     _weight_scaling_recipe,
     float8_e4m3,
@@ -105,3 +107,86 @@ def test_cached_weight_layout_follows_turbos_query(
     assert out == ("rowwise", "colwise")
     assert calls == [expected]
     assert asked_now == asked
+
+
+@pytest.mark.parametrize("with_transpose", [True, False])
+def test_cached_copies_are_not_autograd_leaves(monkeypatch, with_transpose):
+    """Primus-Turbo hands back copies with the weight's requires_grad; as autograd leaves they would sit in
+    AccumulateGrad nodes of every micro-batch's graph (kept alive across steps by the token dispatcher's probs).
+    The cache returns the same tensors with requires_grad cleared; a missing transpose copy stays None."""
+    monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: False)
+    weight = torch.zeros(2, 64, 64, dtype=torch.bfloat16, requires_grad=True)
+    made = []
+
+    def create(weight, dest_dtype, quant_config, need_weight_transpose_cache=False, scaling_recipe=None):
+        rowwise = torch.zeros(weight.shape, dtype=torch.bfloat16, requires_grad=weight.requires_grad)
+        colwise = (
+            torch.zeros(weight.shape, dtype=torch.bfloat16, requires_grad=weight.requires_grad)
+            if need_weight_transpose_cache
+            else None
+        )
+        made.extend((rowwise, colwise))
+        return rowwise, colwise
+
+    monkeypatch.setattr(primus_turbo_ext, "create_quantized_weight", create)
+    rowwise, colwise = _maybe_create_quantized_weight_buffers(
+        weight, float8_e4m3, MXFP8, disable_parameter_transpose_cache=not with_transpose
+    )
+    assert rowwise is made[0] and not rowwise.requires_grad
+    if with_transpose:
+        assert colwise is made[1] and not colwise.requires_grad
+    else:
+        assert colwise is None
+
+
+class _UsesRowCopyOnly(torch.autograd.Function):
+    """A GEMM stand-in: y = x @ w^T; returns the wgrad for the row copy and none for the transpose copy."""
+
+    @staticmethod
+    def forward(ctx, x, w, w_t):
+        ctx.save_for_backward(x, w)
+        return x @ w.t()
+
+    @staticmethod
+    def backward(ctx, grad_y):
+        x, w = ctx.saved_tensors
+        return grad_y @ w, grad_y.t() @ x, None
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_bridge_routes_the_wgrad_without_a_transpose_gradient(monkeypatch, fused):
+    """Through _bridge_weight_grad with non-leaf cached copies: unfused, the row copy's wgrad lands in main_grad
+    on every micro-batch; fused (the GEMM accumulated already), main_grad is left alone. The transpose copy gets
+    no gradient, which backward must take as None (no materialized zero tensor of the weight's shape)."""
+    monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: False)
+    # the dummy wgrad handed to autograd for the parameter, on the test's (CPU) device
+    monkeypatch.setattr(
+        primus_turbo_ext, "_get_dummy_wgrad", lambda shape, dtype, zero=False: torch.empty(shape, dtype=dtype)
+    )
+    materialize = []
+    original = torch.autograd.function.FunctionCtx.set_materialize_grads
+
+    def record(ctx, value):
+        materialize.append(value)
+        return original(ctx, value)
+
+    monkeypatch.setattr(torch.autograd.function.FunctionCtx, "set_materialize_grads", record)
+    torch.manual_seed(0)
+    weight = torch.nn.Parameter(torch.randn(8, 16))
+    weight.main_grad = torch.zeros(8, 16)
+    weight.grad_added_to_main_grad = False
+    rowwise = weight.detach().clone()
+    colwise = weight.detach().t().contiguous()
+    expected = torch.zeros(8, 16)
+    for _ in range(2):  # two micro-batches
+        x = torch.randn(4, 16, requires_grad=True)
+        grad_y = torch.randn(4, 8)
+        bridged_x, pair = _bridge_weight_grad(
+            x, weight, PrimusTurboQuantizedTensorPair(data=rowwise, data_t=colwise), fuse_wgrad_accum=fused
+        )
+        _UsesRowCopyOnly.apply(bridged_x, pair.data, pair.data_t).backward(grad_y)
+        torch.testing.assert_close(x.grad, grad_y @ rowwise)
+        expected += grad_y.t() @ x.detach()
+        assert weight.grad_added_to_main_grad
+    torch.testing.assert_close(weight.main_grad, torch.zeros(8, 16) if fused else expected)
+    assert materialize == [False, False]  # the bridge opts out of zero-filled gradients, once per micro-batch
