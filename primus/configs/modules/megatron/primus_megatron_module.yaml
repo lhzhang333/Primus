@@ -122,6 +122,14 @@ te_ce_overwrite_input: true
 # cannot be combined with use_turbo_cross_entropy.
 deferred_cross_entropy: false
 
+# Embedding wgrad straight into main_grad: the token rows are added into the
+# word embedding's main_grad (sorted, deterministic index_put_ accumulate) instead
+# of a dense table-sized gradient being zero-filled every micro-batch and then
+# added in full (DeepSeek-V3: 1.73 GiB). TP=1, gradient_accumulation_fusion, not
+# for a weight with zero_out_wgrad (tied output layer / MTP). Env
+# PRIMUS_EMBEDDING_WGRAD_FUSION overrides.
+embedding_wgrad_fusion: false
+
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
 # master barely moves (improves MXFP4 training convergence). Requires
