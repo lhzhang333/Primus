@@ -836,7 +836,8 @@ def _takes_scaling_recipe(fn) -> bool:
 
 
 def _not_leaves(*copies):
-    """The cached quantized copies of a weight, as tensors that do not require grad.
+    """The cached quantized copies of a weight, as tensors that do not require grad (anything else, such as a
+    missing transpose copy, passes through unchanged).
 
     Primus-Turbo's ``create_quantized_weight`` gives them the weight's ``requires_grad``, which makes each an
     autograd leaf: passing it through :func:`_bridge_weight_grad` then puts an AccumulateGrad node holding it
@@ -845,7 +846,9 @@ def _not_leaves(*copies):
     so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
     step's first microbatch: 3 x 2.7 GiB on top of the new caches at the DeepSeek-V3 proxy's allocation peak.
     """
-    return tuple(c.requires_grad_(False) if c is not None and c.requires_grad else c for c in copies)
+    return tuple(
+        c.requires_grad_(False) if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies
+    )
 
 
 def _maybe_create_quantized_weight_buffers(
