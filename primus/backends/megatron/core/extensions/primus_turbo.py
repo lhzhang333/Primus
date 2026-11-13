@@ -394,6 +394,10 @@ def _bridge_weight_grad(
         @staticmethod
         def forward(ctx, x, weight, quantized_weight, quantized_weight_trans):
             ctx.save_for_backward(weight)
+            # The GEMMs return no gradient for the transpose copy (an operand of their backward only), and
+            # backward ignores it: without this, autograd would hand backward a materialized zero tensor of
+            # the full weight shape for it on every microbatch (1.75 GiB + a memset for a DeepSeek-V3 expert fc1).
+            ctx.set_materialize_grads(False)
             return x, quantized_weight, quantized_weight_trans
 
         @staticmethod
@@ -418,7 +422,9 @@ def _bridge_weight_grad(
                 # the dummy wgrad returned below means they are not recoverable from
                 # param.grad either. The fused path above is immune because its beta=1
                 # epilogue accumulates on every microbatch regardless of the flag.
-                if _is_gfx1250():
+                if grad_quantized_weight is None:  # set_materialize_grads(False): no gradient reached it
+                    pass
+                elif _is_gfx1250():
                     inplace_add_triton_(weight.main_grad, grad_quantized_weight)
                 else:
                     weight.main_grad.add_(grad_quantized_weight)
@@ -559,6 +565,19 @@ def _takes_scaling_recipe(fn) -> bool:
         return False
 
 
+def _not_leaves(*copies):
+    """The cached quantized copies of a weight, as tensors that do not require grad.
+
+    Primus-Turbo's ``create_quantized_weight`` gives them the weight's ``requires_grad``, which makes each an
+    autograd leaf: passing it through :func:`_bridge_weight_grad` then puts an AccumulateGrad node holding it
+    into the graph (the bridge's outputs need no such leaf: they require grad through ``weight``). Megatron's
+    token dispatcher keeps the last microbatch's ``probs`` (and so that graph) until the layer's next forward,
+    so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
+    step's first microbatch: 3 x 2.7 GiB on top of the new caches at the DeepSeek-V3 proxy's allocation peak.
+    """
+    return tuple(c.requires_grad_(False) if c is not None and c.requires_grad else c for c in copies)
+
+
 def _maybe_create_quantized_weight_buffers(
     weight: torch.Tensor,
     dest_dtype: torch.dtype,
@@ -583,12 +602,14 @@ def _maybe_create_quantized_weight_buffers(
         recipe = _mx_weight_layout_recipe(quant_config_internal, weight)
         if recipe is not None and _takes_scaling_recipe(create_quantized_weight):
             kwargs["scaling_recipe"] = recipe
-        return create_quantized_weight(
-            weight,
-            dest_dtype,
-            quant_config_internal,
-            need_weight_transpose_cache=need_weight_transpose_cache,
-            **kwargs,
+        return _not_leaves(
+            *create_quantized_weight(
+                weight,
+                dest_dtype,
+                quant_config_internal,
+                need_weight_transpose_cache=need_weight_transpose_cache,
+                **kwargs,
+            )
         )
 
     # TODO(ruibin): Remove this fallback path once create_quantized_weight is
@@ -631,7 +652,7 @@ def _maybe_create_quantized_weight_buffers(
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
 
-    return quantized_weight_rowwise, quantized_weight_colwise
+    return _not_leaves(quantized_weight_rowwise, quantized_weight_colwise)
 
 
 def _call_fp8_autocast_enter(
