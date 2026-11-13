@@ -252,16 +252,24 @@ def _bridge_activation_grad(
 #   input  an RMSNorm linked to its only readers (MLA's input_layernorm -> q_down / kv_down, see
 #          ``link_mxfp8_norm_readers``) returns a NaN carrier with the pair attached; each reader takes it
 #          once;
-#   1/all  both.
+#   mlp    a MoE layer's pre-MLP RMSNorm linked to its shared experts on Primus-Turbo's mlp_fp8
+#          (``link_mxfp8_mlp_norm_reader``): its output is still written (the router and the token dispatcher
+#          read it) and carries the pair for the shared experts' fc1;
+#   1/all  every site.
 # Taken only when every reader runs Turbo MXFP8 in its own quant context, in the layout the pair is made in.
 _FUSED_MXFP8_ACTIVATION_ATTR = "_primus_fused_mxfp8_activation"
-_MXFP8_FUSED_NORM_SITES = ("up", "input")
+_MXFP8_FUSED_NORM_SITES = ("up", "input", "mlp")
 _LOGGED_FUSED_MXFP8_SITES = set()
 
 
 def mxfp8_fused_norm_sites() -> frozenset:
-    """The sites PRIMUS_MXFP8_FUSED_NORM switches on: 0 (default), up, input, a comma list, or 1 / all."""
-    value = os.environ.get("PRIMUS_MXFP8_FUSED_NORM", "0").strip().lower()
+    """The sites PRIMUS_MXFP8_FUSED_NORM switches on: 0 (default), up, input, mlp, a comma list, or 1 / all."""
+    return _parse_mxfp8_fused_norm_sites(os.environ.get("PRIMUS_MXFP8_FUSED_NORM", "0"))
+
+
+@lru_cache(maxsize=16)
+def _parse_mxfp8_fused_norm_sites(raw: str) -> frozenset:
+    value = raw.strip().lower()
     if value in ("", "0", "off", "false", "no"):
         return frozenset()
     if value in ("1", "all", "on", "true", "yes"):
@@ -270,7 +278,7 @@ def mxfp8_fused_norm_sites() -> frozenset:
     unknown = sites.difference(_MXFP8_FUSED_NORM_SITES)
     if unknown:
         raise ValueError(
-            f"PRIMUS_MXFP8_FUSED_NORM: unknown site(s) {sorted(unknown)}; use 0, 1, up, input or up,input"
+            f"PRIMUS_MXFP8_FUSED_NORM: unknown site(s) {sorted(unknown)}; use 0, 1 or a comma list of up, input, mlp"
         )
     return sites
 
@@ -291,9 +299,11 @@ def _mxfp8_activation_recipes(weight) -> Tuple[ScalingRecipe, ScalingRecipe]:
     """(row, column) scaling recipes a prequantized MXFP8 input of ``gemm_fp8(a, weight)`` must carry:
     Primus-Turbo's MX GEMM layouts (packed scales; plus 16x16 codes for the column copy, wgrad's B operand)
     when that GEMM runs on them, raw ones otherwise. ``weight``: the bf16 parameter (its cache is made in the
-    matching layout, see ``_mx_weight_layout_recipe``) or that cached QuantizedTensor."""
+    matching layout, see ``_mx_weight_layout_recipe``) or that cached QuantizedTensor (or pair)."""
     from primus_turbo.pytorch.ops.utils import MX_A, MX_B, mx_gemm_layout
 
+    if PrimusTurboQuantizedTensorPair is not None and isinstance(weight, PrimusTurboQuantizedTensorPair):
+        weight = weight.data  # a cached weight's (W, W^T) pair: W's recipe decides
     return (MX_A, MX_B) if mx_gemm_layout(weight) else (ScalingRecipe(), ScalingRecipe())
 
 
@@ -322,9 +332,23 @@ def can_consume_fused_mxfp8_activation(module) -> bool:
     if getattr(module, "offload", False):
         return False
     # Called from the producer, outside the module's forward: enter its quant context briefly (as the MXFP4
-    # probe does) so the answer is this linear's recipe, not the surrounding state.
-    with _get_fp8_autocast_for_quant_params(module.te_quant_params, module.training):
-        return _in_mxfp8_linear_context()
+    # probe does) so the answer is this linear's recipe, not the surrounding state. Memoized per module and
+    # autocast state (a linear's te_quant_params are fixed once built).
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    quant = manager.get_turbo_quant_config()
+    key = (
+        module.training,
+        manager.is_fp8_enabled(),
+        manager.is_turbo_fp8_enabled(),
+        manager.is_turbo_fp4_enabled(),
+        None if quant is None else id(quant),
+    )
+    cache = module.__dict__.setdefault("_primus_mxfp8_consumer_cache", {})
+    hit = cache.get(key)
+    if hit is None:
+        with _get_fp8_autocast_for_quant_params(module.te_quant_params, module.training):
+            hit = cache[key] = (quant, _in_mxfp8_linear_context())  # (keeps ``quant`` alive: its id is in the key)
+    return hit[1]
 
 
 def attach_fused_mxfp8_activation(carrier: torch.Tensor, pair, readers: int) -> None:
@@ -405,10 +429,22 @@ def _fused_rmsnorm_mxfp8_carrier(norm, x: torch.Tensor, gamma: torch.Tensor):
     ((row_recipe, col_recipe),) = recipes
     _, pair = rmsnorm_mxfp8(x, gamma, norm.eps, write_y=False, row_recipe=row_recipe, col_recipe=col_recipe)
     # Never read: every reader takes the pair. NaN (no storage behind it) should anything else read it.
-    carrier = torch.full((), float("nan"), dtype=x.dtype, device=x.device).expand(x.shape)
+    carrier = _nan_scalar(x.dtype, x.device).expand(x.shape)
     attach_fused_mxfp8_activation(carrier, pair, len(modules))
     _log_fused_mxfp8_once("input", norm, x)
     return carrier
+
+
+_NAN_SCALARS: dict = {}
+
+
+def _nan_scalar(dtype, device) -> torch.Tensor:
+    """A cached 0-d NaN of ``dtype`` on ``device``: the input site's carriers are views of it (no fill per call)."""
+    key = (dtype, device)
+    t = _NAN_SCALARS.get(key)
+    if t is None:
+        t = _NAN_SCALARS[key] = torch.full((), float("nan"), dtype=dtype, device=device)
+    return t
 
 
 def link_mxfp8_norm_readers(layer) -> bool:
@@ -432,6 +468,46 @@ def link_mxfp8_norm_readers(layer) -> bool:
     if getattr(getattr(attn, "core_attention", None), "requires_dsa_inputs", False):
         return False
     norm._primus_mxfp8_readers = tuple(weakref.ref(r) for r in readers)
+    return True
+
+
+def _fused_rmsnorm_mxfp8_mlp(norm, x: torch.Tensor, gamma: torch.Tensor):
+    """Site ``mlp``: the output of ``norm`` (a pre-MLP RMSNorm linked to its MoE layer's shared experts), written --
+    the router and the token dispatcher read it -- and carrying the MXFP8 pair for the shared experts' mlp_fp8 fc1;
+    or None when the shared experts do not take mlp_fp8 here."""
+    ref = getattr(norm, "_primus_mxfp8_mlp_reader", None)
+    if ref is None or "mlp" not in mxfp8_fused_norm_sites():
+        return None
+    from primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches import (
+        _routes_here,
+    )
+
+    rmsnorm_mxfp8, mlp = _turbo_rmsnorm_mxfp8(), ref()
+    if rmsnorm_mxfp8 is None or mlp is None or _use_split_wgrad_op() or not _routes_here(mlp):
+        return None
+    row_recipe, col_recipe = _mxfp8_activation_recipes(mlp.linear_fc1._parameters["weight"])
+    y, pair = rmsnorm_mxfp8(x, gamma, norm.eps, write_y=True, row_recipe=row_recipe, col_recipe=col_recipe)
+    attach_fused_mxfp8_activation(y, pair, 1)
+    _log_fused_mxfp8_once("mlp", norm, x)
+    return y
+
+
+def link_mxfp8_mlp_norm_reader(layer) -> bool:
+    """Site ``mlp``: link a TransformerLayer's pre-MLP RMSNorm to its MoE layer's shared experts when they run
+    through Primus-Turbo's mlp_fp8 (the dense MLP MXFP8 patch) and take the norm's output object as is (no overlap
+    with the dispatcher, no recompute or offload of the norm or of the shared experts)."""
+    norm = getattr(layer, "pre_mlp_layernorm", None)
+    mlp = getattr(layer, "mlp", None)
+    shared = getattr(mlp, "shared_experts", None)
+    if not isinstance(norm, PrimusTurboRMSNorm) or shared is None:
+        return False
+    if not getattr(shared, "_turbo_dense_mlp_mxfp8", False):
+        return False
+    if getattr(mlp, "shared_expert_overlap", False) or getattr(mlp, "shared_experts_recompute", False):
+        return False
+    if getattr(layer, "recompute_pre_mlp_layernorm", False) or getattr(layer, "offload_mlp_norm", False):
+        return False
+    norm._primus_mxfp8_mlp_reader = weakref.ref(shared)
     return True
 
 
@@ -3247,6 +3323,10 @@ class PrimusTurboRMSNorm(te.pytorch.RMSNorm):
             # uniform value, gradients ~0). The fused-residual path does the
             # same thing -- see fused_residual_rmsnorm.py.
             weight = weight + 1
+        # site ``mlp`` (PRIMUS_MXFP8_FUSED_NORM): the output, carrying the shared experts' MXFP8 operands
+        y = _fused_rmsnorm_mxfp8_mlp(self, x, weight)
+        if y is not None:
+            return y
         # site ``input`` (PRIMUS_MXFP8_FUSED_NORM): the linked readers' MXFP8 operands on a never-read carrier
         carrier = _fused_rmsnorm_mxfp8_carrier(self, x, weight)
         if carrier is not None:

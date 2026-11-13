@@ -276,6 +276,43 @@ def test_close_to_megatron_swiglu(mx_state, monkeypatch, s, b, h, i):
     assert abs(_snr(got[0], ref32) - _snr(ref[0], ref32)) <= 0.5, (_snr(got[0], ref32), _snr(ref[0], ref32))
 
 
+@gpu
+@pytest.mark.parametrize("micro_batches", [1, 2])
+def test_fused_pre_mlp_norm_bitwise(mx_state, monkeypatch, micro_batches):
+    """PRIMUS_MXFP8_FUSED_NORM=mlp: the pre-MLP RMSNorm still writes y (the router and the token dispatcher read it)
+    and hands the shared experts' mlp_fp8 its MXFP8 pair -- bit for bit Turbo's RMSNorm followed by mlp_fp8: y, the
+    shared experts' output, dx, dgamma and both main_grads, per micro-batch."""
+    import weakref
+
+    if mx_state._turbo_rmsnorm_mxfp8() is None:
+        pytest.skip("needs Primus-Turbo's rmsnorm_mxfp8")
+    monkeypatch.setattr(mx_state, "get_num_microbatches", lambda: micro_batches)
+    s, b, h, i = 512, 2, 1024, 512
+    attr = mx_state._FUSED_MXFP8_ACTIVATION_ATTR
+
+    def run(fused):
+        monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", "mlp" if fused else "0")
+        fc1, fc2 = _linear(2 * i, h, 1, torch.bfloat16), _linear(h, i, 2, torch.bfloat16)
+        mlp = _Stub(linear_fc1=fc1, linear_fc2=fc2, config=fc1.config, training=True)
+        gamma = torch.nn.Parameter(1 + 0.1 * _randn(h, seed=3))
+        norm = _Stub(weight=gamma, zero_centered_gamma=False, eps=1e-6)
+        norm._primus_mxfp8_mlp_reader = weakref.ref(mlp)
+        res = []
+        for mb in range(micro_batches):
+            x = _randn(s, b, h, seed=10 + mb).requires_grad_()
+            y = mx_state.PrimusTurboRMSNorm.forward(norm, x)
+            assert hasattr(y, attr) == fused
+            router = (y.float() * _randn(s, b, h, seed=30 + mb).float()).sum()  # the router / dispatcher read y
+            out, _ = patch._forward_turbo_dense_mlp_mxfp8(mlp, y)
+            assert not hasattr(y, attr), "the shared experts did not take the pair"
+            (router + (out.float() * _randn(s, b, h, seed=20 + mb).float()).sum()).backward()
+            res += [y.detach(), out.detach(), x.grad]
+        return res + [gamma.grad] + [fc._parameters["weight"].main_grad for fc in (fc1, fc2)]
+
+    for k, (a, r) in enumerate(zip(run(True), run(False))):
+        assert torch.equal(a, r), f"result {k}: max |diff| {(a.float() - r.float()).abs().max().item()}"
+
+
 def test_install_wraps_mlp(stub_types, monkeypatch):
     """The patch wraps Megatron's MLP: constructor decides (an expert never), forward routes per call (else the
     original forward with per_token_scale), backward_dw stands down only after a routed forward."""

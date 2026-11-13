@@ -63,8 +63,8 @@ def _turbo_mxfp8_state(monkeypatch):
 
 @pytest.mark.parametrize(
     "value, sites",
-    [("0", set()), ("", set()), ("1", {"up", "input"}), ("all", {"up", "input"}), ("up", {"up"}),
-     ("input", {"input"}), ("up, input", {"up", "input"})],  # fmt: skip
+    [("0", set()), ("", set()), ("1", {"up", "input", "mlp"}), ("all", {"up", "input", "mlp"}), ("up", {"up"}),
+     ("input", {"input"}), ("mlp", {"mlp"}), ("up, input", {"up", "input"})],  # fmt: skip
 )
 def test_sites(monkeypatch, value, sites):
     monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", value)
@@ -171,9 +171,9 @@ def test_up_site_matches_unfused(monkeypatch):
     fused = _run_up(monkeypatch, "up", x_full, h, n)
     assert calls, "the fused producer did not run"
     ref = _run_up(monkeypatch, "0", x_full, h, n)
-    for name, a, r in zip(("out", "dx", "dgamma", "dW"), fused, ref):
+    for name, a, r in zip(("out", "dx", "dgamma", "dW"), fused, ref):  # Turbo's rstd / y / codes: bit for bit
         assert torch.isfinite(a).all(), name
-        assert _snr(a, r) > 40, (name, _snr(a, r))
+        assert torch.equal(a, r), (name, _snr(a, r))
 
 
 def _run_input(monkeypatch, sites, x, h, ns):
@@ -206,7 +206,7 @@ def test_input_site_matches_unfused(monkeypatch):
     for name, a, r in zip(names, fused, ref):
         for ai, ri in zip(a, r) if isinstance(a, list) else ((a, r),):
             assert torch.isfinite(ai).all(), name
-            assert _snr(ai, ri) > 40, (name, _snr(ai, ri))
+            assert torch.equal(ai, ri), (name, _snr(ai, ri))
 
 
 @pytest.mark.skipif(not HAVE_OP, reason="needs Primus-Turbo's rmsnorm_mxfp8")

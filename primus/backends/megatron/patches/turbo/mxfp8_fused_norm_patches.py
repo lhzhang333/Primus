@@ -25,7 +25,7 @@ def _input_site_enabled(ctx: PatchContext) -> bool:
         mxfp8_fused_norm_sites,
     )
 
-    return "input" in mxfp8_fused_norm_sites()
+    return bool({"input", "mlp"} & mxfp8_fused_norm_sites())
 
 
 @register_patch(
@@ -41,8 +41,12 @@ def patch_mxfp8_fused_norm(ctx: PatchContext):
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from primus.backends.megatron.core.extensions.primus_turbo import (
+        link_mxfp8_mlp_norm_reader,
         link_mxfp8_norm_readers,
+        mxfp8_fused_norm_sites,
     )
+
+    sites = mxfp8_fused_norm_sites()
 
     init = TransformerLayer.__init__
     if getattr(init, "_primus_mxfp8_norm_link", False):
@@ -51,10 +55,16 @@ def patch_mxfp8_fused_norm(ctx: PatchContext):
     @functools.wraps(init)
     def __init__(self, *args, **kwargs):
         init(self, *args, **kwargs)
-        if link_mxfp8_norm_readers(self):
+        layer = getattr(self, "layer_number", "?")
+        if "input" in sites and link_mxfp8_norm_readers(self):
             log_rank_0(
-                f"[Patch:megatron.turbo.mxfp8_fused_norm] layer {getattr(self, 'layer_number', '?')}: "
+                f"[Patch:megatron.turbo.mxfp8_fused_norm] layer {layer}: "
                 "input_layernorm -> MXFP8 operands of linear_q_down_proj / linear_kv_down_proj"
+            )
+        if "mlp" in sites and link_mxfp8_mlp_norm_reader(self):
+            log_rank_0(
+                f"[Patch:megatron.turbo.mxfp8_fused_norm] layer {layer}: "
+                "pre_mlp_layernorm -> MXFP8 operands of the shared experts' mlp_fp8"
             )
 
     __init__._primus_mxfp8_norm_link = True
