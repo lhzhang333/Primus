@@ -188,3 +188,44 @@ def test_expandable_segments_false_still_warns(captured_warnings, monkeypatch):
 def test_no_turbo_grouped_gemm_does_not_warn(captured_warnings, args):
     warn_turbo_grouped_gemm_without_expandable_segments(args)
     assert captured_warnings == []
+
+
+_MXFP8 = dict(fp8="e4m3", fp8_recipe="mxfp8", enable_primus_turbo=True, use_turbo_gemm=True)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, dict(use_turbo_gemm=False, use_turbo_grouped_gemm=True),
+     dict(use_turbo_gemm=False, use_turbo_mega_moe=True, turbo_mega_moe_precision="mxfp8")],  # fmt: skip
+)
+def test_mxfp8_on_gfx1250_with_a_turbo_gemm(monkeypatch, overrides):
+    import primus.core.utils.gpu_arch as gpu_arch
+
+    monkeypatch.setattr(gpu_arch, "is_gfx1250", lambda: True)
+    rocm_arg_validation.validate_mxfp8_on_gfx1250(SimpleNamespace(**{**_MXFP8, **overrides}))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [dict(use_turbo_gemm=False), dict(enable_primus_turbo=False),
+     dict(use_turbo_gemm=False, use_turbo_mega_moe=True, turbo_mega_moe_precision="bf16")],  # fmt: skip
+)
+def test_mxfp8_on_gfx1250_without_a_turbo_gemm_is_refused(monkeypatch, overrides):
+    """Nothing would quantize (TE's autocast stays off there): refused instead of a silent BF16 run."""
+    import primus.core.utils.gpu_arch as gpu_arch
+
+    monkeypatch.setattr(gpu_arch, "is_gfx1250", lambda: True)
+    with pytest.raises(ValueError, match="gfx1250"):
+        rocm_arg_validation.validate_mxfp8_on_gfx1250(SimpleNamespace(**{**_MXFP8, **overrides}))
+
+
+@pytest.mark.parametrize(
+    "overrides, gfx1250",
+    [(dict(use_turbo_gemm=False), False),  # TE's MXFP8 elsewhere
+     (dict(fp8=None, use_turbo_gemm=False), True), (dict(fp8_recipe="tensorwise", use_turbo_gemm=False), True)],  # fmt: skip
+)
+def test_mxfp8_check_leaves_other_runs_alone(monkeypatch, overrides, gfx1250):
+    import primus.core.utils.gpu_arch as gpu_arch
+
+    monkeypatch.setattr(gpu_arch, "is_gfx1250", lambda: gfx1250)
+    rocm_arg_validation.validate_mxfp8_on_gfx1250(SimpleNamespace(**{**_MXFP8, **overrides}))
