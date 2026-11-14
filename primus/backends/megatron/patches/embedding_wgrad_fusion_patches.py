@@ -9,29 +9,26 @@ Embedding wgrad straight into main_grad
 =======================================
 
 Megatron's ``VocabParallelEmbedding`` backward is ``embedding_dense_backward``: every micro-batch it allocates a
-zeroed gradient the size of the whole table (DeepSeek-V3: [129408, 7168] bf16, 1.73 GiB), scatters the token rows
-into it, and Megatron's grad hook then adds all of it into ``main_grad``. With this patch the backward computes
-the same per-row sums on a compacted index space -- ``embedding_dense_backward`` over each token's slot (its id's
-rank among the batch's distinct ids, from a stable sort: no host sync), so a row's tokens are summed exactly as
-today -- and a small Triton kernel adds each touched row's sum onto ``main_grad`` as Megatron's grad hook does
-(``main_grad.add_(grad)``): bitwise today's result, without the table-sized gradient, fill or add. It sets
-``grad_added_to_main_grad`` and hands autograd a dummy from the shared dummy-wgrad pool; the forward is unchanged
-(``F.embedding``). (``index_put_(accumulate=True)`` would be simpler, but on the ROCm torch of 11-13 it returns
-wrong sums for repeated ids.) Opt-in:
+zeroed gradient the size of the whole table, scatters the token rows into it, and Megatron's grad hook then adds all
+of it into ``main_grad``. With this patch the backward computes the same per-row sums on a compacted index space --
+``embedding_dense_backward`` over each token's slot (its id's rank among the batch's distinct ids, from a stable
+sort: no host sync), so a row's tokens are summed exactly as in the dense gradient -- and a small Triton kernel adds
+each touched row's sum onto ``main_grad`` as Megatron's grad hook does (``main_grad.add_(grad)``). The result is
+bitwise the unfused one, without the table-sized gradient, its fill or its add. It sets ``grad_added_to_main_grad``
+and hands autograd a dummy from the shared dummy-wgrad pool; the forward is unchanged (``F.embedding``).
+(``index_put_(accumulate=True)`` into ``main_grad`` would add every token row separately in ``main_grad``'s dtype,
+a different rounding from the dense gradient's per-row sums.) Opt-in (default off):
 
-    YAML  embedding_wgrad_fusion: true
-    env   PRIMUS_EMBEDDING_WGRAD_FUSION=1   (overrides YAML)
+    embedding_wgrad_fusion: true
 
 Taken per forward only for TP = 1 without GTP rematerialization or reduce-scatter, under
 ``gradient_accumulation_fusion`` with a ``main_grad`` on the weight, while training with grad enabled outside
-torch's deterministic-algorithms mode (Megatron's ``deterministic_mode`` keeps its ``weight[ids]``), and never
-for a weight with ``zero_out_wgrad`` (shared with another layer of the stage: a tied output layer, MTP), whose
-other uses add real gradients through autograd.
+Megatron's ``deterministic_mode`` (which embeds with ``weight[ids]``), and never for a weight with
+``zero_out_wgrad`` (shared with another layer of the stage: a tied output layer, MTP), whose other uses add real
+gradients through autograd.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.nn.functional as F
@@ -43,20 +40,15 @@ from primus.core.utils.module_utils import log_rank_0
 _PATCH_KEY = "megatron.embedding_wgrad_fusion"
 
 
-def _requested(args) -> bool:
-    env = os.environ.get("PRIMUS_EMBEDDING_WGRAD_FUSION")
-    if env is not None:
-        return env not in ("0", "", "false", "False")
-    return bool(getattr(args, "embedding_wgrad_fusion", False))
-
-
 def _dummy_wgrad(shape, dtype):
     """A never-read tensor of the weight's shape from the shared dummy-wgrad pool (Primus-Turbo's, which TE's and
     Primus' helpers draw on too), else TE's."""
     try:
         from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad
     except ImportError:
-        from transformer_engine.pytorch.module.base import get_dummy_wgrad as _get_dummy_wgrad
+        from transformer_engine.pytorch.module.base import (
+            get_dummy_wgrad as _get_dummy_wgrad,
+        )
     return _get_dummy_wgrad(list(shape), dtype)
 
 
@@ -74,7 +66,7 @@ def _row_add_kernel():
 
         @triton.jit
         def kernel(main, sums, row_of_slot, nslots, H, ld_main, ld_sums, BLOCK: tl.constexpr):
-            u = tl.program_id(0)
+            u = tl.program_id(0).to(tl.int64)  # u * ld_sums and row * ld_main can pass 2**31
             if u < tl.load(nslots):
                 row = tl.load(row_of_slot + u)
                 cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -136,7 +128,7 @@ def _fusable(emb, ids) -> bool:
     return (
         emb.training
         and torch.is_grad_enabled()
-        and not torch.are_deterministic_algorithms_enabled()  # (Megatron's deterministic_mode: weight[ids] there)
+        and not getattr(emb, "deterministic_mode", True)  # Megatron embeds with weight[ids] there
         and w.requires_grad
         and ids.dtype == torch.int64
         and emb.tp_group.size() == 1
@@ -168,7 +160,7 @@ def _install_embedding_wgrad_fusion_patch() -> None:
 
 
 def _patch_condition(ctx: PatchContext) -> bool:
-    return _requested(get_args(ctx))
+    return bool(getattr(get_args(ctx), "embedding_wgrad_fusion", False))
 
 
 @register_patch(

@@ -4,42 +4,40 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""CPU coverage of megatron.te.cross_entropy_cg_capturable: Megatron's te_parallel_cross_entropy (or Primus'
-overwrite_input wrapper) called with is_cg_capturable=True, and the TE assumption that makes it bitwise."""
+"""megatron.te.cross_entropy_cg_capturable on CPU: Megatron's te_parallel_cross_entropy (or Primus' overwrite_input
+wrapper) called with is_cg_capturable=True; its order with the deferred cross entropy, which must keep its own path;
+and the TE assumption that makes the flag bitwise."""
 
 import inspect
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import primus.backends.megatron.patches.te_patches.cross_entropy_deferred_patches as deferred
 import primus.backends.megatron.patches.te_patches.cross_entropy_overwrite_patches as mod
+from primus.core.patches.patch_registry import PatchRegistry
 
 
 def _ctx(**args):
     defaults = dict(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
     defaults.update(args)
-    return SimpleNamespace(extra={"args": SimpleNamespace(**defaults)})
-
-
-def test_switch_default_off(monkeypatch):
-    monkeypatch.delenv("PRIMUS_TE_CE_CG_CAPTURABLE", raising=False)
-    assert not mod.cg_capturable_requested()
-    monkeypatch.setenv("PRIMUS_TE_CE_CG_CAPTURABLE", "1")
-    assert mod.cg_capturable_requested()
+    return SimpleNamespace(extra={"module_config": SimpleNamespace(params=SimpleNamespace(**defaults))})
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    "args,want",
     [
-        ({}, True),
-        ({"cross_entropy_loss_fusion": False}, False),
-        ({"cross_entropy_fusion_impl": "native"}, False),
+        ({}, False),
+        (dict(te_cross_entropy_cg_capturable=True), True),
+        (dict(te_cross_entropy_cg_capturable=True, cross_entropy_loss_fusion=False), False),
+        (dict(te_cross_entropy_cg_capturable=True, cross_entropy_fusion_impl="native"), False),
     ],
 )
-def test_only_for_te_fused_cross_entropy(monkeypatch, args, expected):
-    monkeypatch.setattr(mod, "get_args", lambda ctx: ctx.extra["args"])
-    assert mod._te_fused_cross_entropy(_ctx(**args)) is expected
+def test_yaml_flag_and_te_fused_cross_entropy_only(args, want):
+    assert mod._cg_capturable_enabled(_ctx(**args)) is want
 
 
 def test_wrapper_passes_is_cg_capturable_true():
@@ -80,10 +78,71 @@ def test_install_sets_both_modules():
 
     te_ext = SimpleNamespace(te_parallel_cross_entropy=original)
     lm = SimpleNamespace(te_parallel_cross_entropy=original)
-    assert mod.install_cg_capturable(te_ext, lm)
+    assert mod.install_cg_capturable(te_ext, lm) == "wrapped"
     assert te_ext.te_parallel_cross_entropy is lm.te_parallel_cross_entropy
     assert lm.te_parallel_cross_entropy(None, None, None) is True
-    assert not mod.install_cg_capturable(SimpleNamespace(), SimpleNamespace(te_parallel_cross_entropy=None))
+    empty = SimpleNamespace(te_parallel_cross_entropy=None)
+    assert mod.install_cg_capturable(SimpleNamespace(), empty) == "missing"
+
+
+def test_leaves_an_installed_deferred_cross_entropy_alone():
+    installed = deferred.make_deferred_cross_entropy(lambda *a: "TE")
+    te_ext = SimpleNamespace(te_parallel_cross_entropy=installed)
+    lm = SimpleNamespace(te_parallel_cross_entropy=installed)
+    assert mod.install_cg_capturable(te_ext, lm) == "deferred"
+    assert lm.te_parallel_cross_entropy is installed and te_ext.te_parallel_cross_entropy is installed
+
+
+@pytest.fixture
+def megatron_ce(monkeypatch):
+    """Megatron's two homes of te_parallel_cross_entropy as plain modules holding a recording TE stand-in, so the
+    real patch handlers run on CPU."""
+    calls = []
+
+    def te_parallel_cross_entropy(logits, labels, tp_group, is_cg_capturable=False):
+        calls.append(("TE", is_cg_capturable))
+        return "TE"
+
+    te_ext = types.ModuleType("megatron.core.extensions.transformer_engine")
+    lm_pkg = types.ModuleType("megatron.core.models.common.language_module")
+    lm = types.ModuleType("megatron.core.models.common.language_module.language_module")
+    te_ext.te_parallel_cross_entropy = lm.te_parallel_cross_entropy = te_parallel_cross_entropy
+    lm_pkg.language_module = lm
+    for m in (te_ext, lm_pkg, lm):
+        monkeypatch.setitem(sys.modules, m.__name__, m)
+    for parent, child in (("megatron.core.extensions", te_ext), ("megatron.core.models.common", lm_pkg)):
+        if parent in sys.modules:
+            monkeypatch.setattr(sys.modules[parent], child.__name__.rsplit(".", 1)[1], child, raising=False)
+    return SimpleNamespace(te_ext=te_ext, lm=lm, calls=calls)
+
+
+def test_with_deferred_cross_entropy_the_deferred_path_stays(megatron_ce, monkeypatch):
+    """The three cross-entropy patches in the order run_patches applies them: overwrite_input, cg_capturable,
+    deferred. Eligible calls take the deferred path; the calls it hands back reach TE with is_cg_capturable=True.
+    """
+    ids = (
+        "megatron.te.cross_entropy_overwrite_input",
+        "megatron.te.cross_entropy_cg_capturable",
+        "megatron.te.cross_entropy_deferred",
+    )
+    patches = sorted((PatchRegistry.get(i) for i in ids), key=lambda p: p.priority)
+    assert [p.id for p in patches] == list(ids)
+    monkeypatch.setattr(deferred, "eligible", lambda logits, labels, tp_group, cg: not cg)
+    monkeypatch.setattr(deferred, "DeferredCrossEntropy", SimpleNamespace(apply=lambda *a: "deferred"))
+    ctx = _ctx(
+        te_ce_overwrite_input=True,
+        te_cross_entropy_cg_capturable=True,
+        deferred_cross_entropy=True,
+        use_turbo_cross_entropy=False,
+    )
+    for p in patches:
+        assert p.condition(ctx)
+        p.apply(ctx)
+    ce = megatron_ce.lm.te_parallel_cross_entropy
+    assert megatron_ce.te_ext.te_parallel_cross_entropy is ce
+    assert ce(None, None, None, False) == "deferred" and megatron_ce.calls == []
+    assert ce(None, None, None, True) == "TE"  # ineligible (CUDA-graph capture): TE, without its host sync
+    assert megatron_ce.calls == [("TE", True)]
 
 
 def test_te_backward_only_skips_the_scalar_one_check():

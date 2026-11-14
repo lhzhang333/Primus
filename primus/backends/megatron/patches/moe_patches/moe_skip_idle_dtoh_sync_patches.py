@@ -8,62 +8,63 @@
 Skip the all-to-all dispatcher's D2H event wait when nothing was copied to the host
 ====================================================================================
 
-``MoEAlltoAllTokenDispatcher`` copies its routing metadata to the host on a side stream at
-``cuda_dtoh_point`` and waits for those copies (``d2h_event.synchronize()``) at ``cuda_sync_point``.
-With EP = TP = 1 the sync point is ``before_finish``: the CPU value it waits for is
-``tokens_per_expert``. When PrimusTurbo's grouped GEMM consumes ``tokens_per_expert`` on the device
-(``megatron.moe_alltoall_dtoh_turbo_grouped_gemm``), dropless routing keeps ``num_out_tokens`` a Python
-int and the permute is fused (``num_global_tokens_per_local_expert`` stays on the device), the D2H point
-copies nothing, yet every MoE layer's forward still blocks the CPU until the GPU has run everything
-launched so far. That wait throws away the CPU's lead over the GPU: in the 1-GPU DSv3 proxy the first MoE
-layer of every micro-batch waits ~17 ms for the previous micro-batch's backward, after which the forward
-is launch-bound.
+``MoEAlltoAllTokenDispatcher`` copies routing metadata to the host on a side stream at ``cuda_dtoh_point`` and
+waits for those copies (``d2h_event.synchronize()``) at ``cuda_sync_point``. With EP = TP = 1, dropless routing, the
+fused permute and PrimusTurbo's grouped GEMM consuming ``tokens_per_expert`` on the device
+(``megatron.moe_alltoall_dtoh_turbo_grouped_gemm``), the D2H point copies nothing, yet the wait still blocks the
+host once per MoE layer until the GPU has run everything launched before it. The host then cannot queue work ahead
+of the GPU, and the launch time of the kernels after each wait becomes GPU idle time.
 
-This patch wraps whatever ``_maybe_dtoh_and_synchronize`` is installed: at the D2H point it records whether
-any of the dispatcher's metadata (or the returned ``tokens_per_expert``) went from a device tensor to a host
-copy; at a later sync point of the same dispatch it skips ``d2h_event.synchronize()`` only if nothing did.
-Whenever something is copied (EP or TP > 1, token dropping, router padding, unfused permute, or
-``tokens_per_expert`` copied to the host) the wait happens exactly as before. No tensor and no kernel
-changes: the training is bitwise the same.
+This patch wraps the installed ``_maybe_dtoh_and_synchronize``. At the D2H point it compares the dispatcher's
+attributes before and after the call: a copy is an attribute that held a device tensor and holds something else
+afterwards, or one newly set to a host tensor or numpy array; a returned ``tokens_per_expert`` that left the device
+counts too. A later sync point of the same dispatch skips ``d2h_event.synchronize()`` only when the D2H point copied
+nothing. Any copy -- EP or TP > 1, token dropping, router padding, an unfused permute, ``tokens_per_expert`` on the
+host -- keeps the wait. No tensor or kernel changes.
 
 Opt-in (default off):
 
-    env   PRIMUS_MOE_SKIP_IDLE_DTOH_SYNC=1
+    moe_skip_idle_dtoh_sync: true
 """
 
 from __future__ import annotations
 
-import os
-
-from primus.core.patches import PatchContext, register_patch
+from primus.core.patches import PatchContext, get_args, register_patch
 from primus.core.utils.module_utils import log_rank_0
 
 _PATCH_KEY = "megatron.moe_alltoall_skip_idle_dtoh_sync"
-_ENV = "PRIMUS_MOE_SKIP_IDLE_DTOH_SYNC"
-# dispatcher attributes _maybe_dtoh_and_synchronize may copy to the host at cuda_dtoh_point
-_HOST_COPY_ATTRS = (
-    "input_splits",
-    "output_splits",
-    "output_splits_tp",
-    "num_out_tokens",
-    "num_global_tokens_per_local_expert",
-)
+_MISSING = object()
 
 
-def requested() -> bool:
-    return os.environ.get(_ENV, "0") not in ("0", "", "false", "False")
+def _enabled(ctx: PatchContext) -> bool:
+    return bool(getattr(get_args(ctx), "moe_skip_idle_dtoh_sync", False))
 
 
 def _on_device(x) -> bool:
-    """A device (GPU) tensor: torch tensors have ``is_cuda``; host copies (CPU tensors, numpy), ints and
-    None do not."""
+    """A device tensor (anything with ``is_cuda`` True)."""
     return getattr(x, "is_cuda", False) is True
 
 
-def _device_flags(dispatcher, tokens_per_expert):
-    return [_on_device(tokens_per_expert)] + [
-        _on_device(getattr(dispatcher, a, None)) for a in _HOST_COPY_ATTRS
-    ]
+def _on_host(x) -> bool:
+    """Host-side data a device copy could have produced: a CPU tensor (``is_cuda`` False) or a numpy array."""
+    return getattr(x, "is_cuda", None) is False or (
+        type(x).__name__ == "ndarray" and type(x).__module__ == "numpy"
+    )
+
+
+def copied_to_host(before: dict, after: dict) -> bool:
+    """Whether the attribute snapshots ``before`` / ``after`` (``vars`` of the dispatcher around the D2H point)
+    show a device-to-host copy: a device tensor replaced by anything else, or an attribute newly set to host data.
+    """
+    for name, new in after.items():
+        old = before.get(name, _MISSING)
+        if new is old:
+            continue
+        if _on_device(old) and not _on_device(new):
+            return True
+        if _on_host(new):
+            return True
+    return False
 
 
 def wrap_maybe_dtoh_and_synchronize(original):
@@ -76,16 +77,16 @@ def wrap_maybe_dtoh_and_synchronize(original):
         if self.drop_and_pad:  # Megatron does neither copies nor a wait here
             return original(self, point, tokens_per_expert)
         if point == self.cuda_dtoh_point:
-            before = _device_flags(self, tokens_per_expert)
+            before = dict(vars(self))
             out = original(self, point, tokens_per_expert)
-            # host copies made here: a device tensor before, not after. If the sync point is this same point,
-            # the original has already waited (when it had to); a later sync point reads the flag below.
-            after = _device_flags(self, out)
-            self._primus_dtoh_host_copies = any(b and not a for b, a in zip(before, after))
+            # When the sync point is this same point, the original has already waited (if it had to); a later
+            # sync point of this dispatch reads the flag below.
+            self._primus_dtoh_host_copies = copied_to_host(before, vars(self)) or (
+                _on_device(tokens_per_expert) and not _on_device(out)
+            )
             return out
         if point == self.cuda_sync_point and getattr(self, "_primus_dtoh_host_copies", True) is False:
-            if not _maybe_dtoh_and_synchronize._logged:
-                _maybe_dtoh_and_synchronize._logged = True
+            if not _maybe_dtoh_and_synchronize.skipped:
                 log_rank_0(
                     f"[Patch:{_PATCH_KEY}] first skipped D2H event wait at {point}: nothing was copied "
                     f"to the host at {self.cuda_dtoh_point}"
@@ -95,7 +96,6 @@ def wrap_maybe_dtoh_and_synchronize(original):
         return original(self, point, tokens_per_expert)
 
     _maybe_dtoh_and_synchronize._primus_skip_idle_dtoh_sync = True
-    _maybe_dtoh_and_synchronize._logged = False
     _maybe_dtoh_and_synchronize.skipped = 0
     _maybe_dtoh_and_synchronize.__wrapped__ = original
     _maybe_dtoh_and_synchronize.__doc__ = original.__doc__
@@ -108,11 +108,11 @@ def wrap_maybe_dtoh_and_synchronize(original):
     phase="before_train",
     description=(
         "Skip MoEAlltoAllTokenDispatcher's D2H event wait when its D2H point copied nothing to the host "
-        f"(EP1/TP1 + PrimusTurbo grouped gemm on device; {_ENV}=1)"
+        "(moe_skip_idle_dtoh_sync)"
     ),
     # after megatron.moe_alltoall_dtoh_turbo_grouped_gemm (default priority 50), whose method it wraps
     priority=60,
-    condition=lambda ctx: requested(),
+    condition=_enabled,
 )
 def patch_moe_skip_idle_dtoh_sync(ctx: PatchContext) -> None:
     from megatron.core.transformer.moe import token_dispatcher
