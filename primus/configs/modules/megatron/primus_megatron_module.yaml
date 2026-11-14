@@ -92,6 +92,12 @@ moe_skip_idle_dtoh_sync: false
 
 # perf
 pp_warmup: false # set to true to decrease iter-1 time when using pp
+# Record the NaN/Inf checks of the loss and of the DDP bucket grad norms
+# (check_for_nan_in_loss_and_grad, rerun_mode: disabled) during forward_backward_func
+# and evaluate them with one host sync when it returns, before the optimizer step.
+# A failure raises the same error, after the step's remaining micro-batches; no
+# update is applied. No numerical change.
+defer_nonfinite_checks: false
 
 # tool
 dump_pp_data: false
