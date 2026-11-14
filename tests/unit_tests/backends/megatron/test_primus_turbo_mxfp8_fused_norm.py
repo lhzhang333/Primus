@@ -251,14 +251,18 @@ def _bare(cls):
 
 
 def test_link_only_mla_down_projections():
+    """Linked only when nothing else reads or keeps the norm's output. The checks fail closed: an attribute
+    Megatron always sets but a newer one might rename counts as on."""
     q, kv = _bare(PrimusTurboLinear), _bare(PrimusTurboLinear)
     attn = SimpleNamespace(
         config=SimpleNamespace(q_lora_rank=1536),
         linear_q_down_proj=q,
         linear_kv_down_proj=kv,
         core_attention=None,
+        offload_qkv_linear=False,
     )
-    layer = SimpleNamespace(input_layernorm=PrimusTurboRMSNorm(64).cuda(), self_attention=attn)
+    layer = SimpleNamespace(input_layernorm=PrimusTurboRMSNorm(64).cuda(), self_attention=attn,
+                            recompute_input_layernorm=False, offload_attn_norm=False)  # fmt: skip
     assert link_mxfp8_norm_readers(layer)
     assert [r() for r in layer.input_layernorm._primus_mxfp8_readers] == [q, kv]
     dsa = SimpleNamespace(requires_dsa_inputs=True)
@@ -274,3 +278,11 @@ def test_link_only_mla_down_projections():
         other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(), **change})
         assert not link_mxfp8_norm_readers(other), change
         assert not hasattr(other.input_layernorm, "_primus_mxfp8_readers")
+    for missing in ("recompute_input_layernorm", "offload_attn_norm"):
+        other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda()})
+        delattr(other, missing)
+        assert not link_mxfp8_norm_readers(other), missing
+    no_offload_attr = SimpleNamespace(**{k: v for k, v in vars(attn).items() if k != "offload_qkv_linear"})
+    other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(),
+                               "self_attention": no_offload_attr})  # fmt: skip
+    assert not link_mxfp8_norm_readers(other)

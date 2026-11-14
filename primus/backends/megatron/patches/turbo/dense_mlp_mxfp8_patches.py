@@ -85,6 +85,8 @@ def _should_enable(mlp, args, is_expert: bool) -> bool:
         return False
     if getattr(cfg, "add_bias_linear", False) or getattr(cfg, "use_te_activation_func", False):
         return False
+    if getattr(cfg, "layernorm_zero_centered_gamma", False):
+        return False  # the fc1-fused norm here (_apply_fc1_fused_norm) takes gamma as is, without the +1
     if (
         getattr(cfg, "glu_linear_offset", 0.0)
         or getattr(cfg, "activation_func_clamp_value", None) is not None

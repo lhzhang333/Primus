@@ -72,6 +72,7 @@ def test_enabled_for_a_shared_expert_mlp(stub_types):
         ({}, dict(use_te_activation_func=True), False, {}),
         ({}, dict(glu_linear_offset=1.0), False, {}),
         ({}, dict(activation_func_clamp_value=7.0), False, {}),
+        ({}, dict(layernorm_zero_centered_gamma=True), False, {}),  # the fc1-fused norm would miss the +1
         ({}, {}, False, dict(fc1=torch.nn.Linear(2, 2))),  # not a Turbo linear
         ({}, {}, False, dict(fc2=torch.nn.Linear(2, 2))),
     ],

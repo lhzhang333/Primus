@@ -467,6 +467,20 @@ def _nan_scalar(dtype, device) -> torch.Tensor:
     return t
 
 
+_MISSING = object()
+
+
+def _set_and_off(obj, *names) -> bool:
+    """Whether every attribute ``names`` of ``obj`` exists and is false. The link checks fail closed on the
+    attributes Megatron always sets (TransformerLayer, attention, MoELayer): one a newer Megatron renamed counts
+    as on, so a norm is never linked in a configuration the checks exist to exclude."""
+    for name in names:
+        value = getattr(obj, name, _MISSING)
+        if value is _MISSING or value:
+            return False
+    return True
+
+
 def link_mxfp8_norm_readers(layer) -> bool:
     """Site ``input``: link a TransformerLayer's input RMSNorm to its only readers, MLA's q / kv down
     projections (Megatron's ``_qkv_down_projection``), when both are Primus-Turbo linears and nothing else
@@ -481,10 +495,11 @@ def link_mxfp8_norm_readers(layer) -> bool:
         return False
     if not all(isinstance(r, PrimusTurboLinear) for r in readers):
         return False
-    if getattr(layer, "recompute_input_layernorm", False) or getattr(layer, "offload_attn_norm", False):
+    if not _set_and_off(layer, "recompute_input_layernorm", "offload_attn_norm"):
         return False
-    if getattr(attn, "offload_qkv_linear", False):
+    if not _set_and_off(attn, "offload_qkv_linear"):
         return False
+    # only DSA's core attention defines it; Megatron's MLA reads it with the same default
     if getattr(getattr(attn, "core_attention", None), "requires_dsa_inputs", False):
         return False
     norm._primus_mxfp8_readers = tuple(weakref.ref(r) for r in readers)
@@ -519,9 +534,9 @@ def link_mxfp8_mlp_norm_reader(layer) -> bool:
         return False
     if not getattr(shared, "_turbo_dense_mlp_mxfp8", False):
         return False
-    if getattr(mlp, "shared_expert_overlap", False) or getattr(mlp, "shared_experts_recompute", False):
+    if not _set_and_off(mlp, "shared_expert_overlap", "shared_experts_recompute"):
         return False
-    if getattr(layer, "recompute_pre_mlp_layernorm", False) or getattr(layer, "offload_mlp_norm", False):
+    if not _set_and_off(layer, "recompute_pre_mlp_layernorm", "offload_mlp_norm"):
         return False
     norm._primus_mxfp8_mlp_reader = weakref.ref(shared)
     return True
