@@ -5,8 +5,9 @@
 ###############################################################################
 
 """The MXFP8 patches are inert by default: every condition, evaluated the way the patch runner does for every
-Megatron job, is False on default args, raises nothing and imports neither Primus-Turbo nor TransformerEngine (they
-are made unimportable here). Runs without a GPU."""
+Megatron job, is False on the shipped defaults, raises nothing and imports neither Primus-Turbo nor
+TransformerEngine (they are made unimportable here). Runs without a GPU. The host-sync patches and the embedding
+fusion have their own such test (test_host_sync_patches_default_off.py)."""
 
 import importlib
 import sys
@@ -25,10 +26,17 @@ _PATCHES = {
     "megatron.mlp.turbo_dense_mlp_mxfp8": "primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches",
     "megatron.te.shared_dummy_wgrad": "primus.backends.megatron.patches.te_patches.shared_dummy_wgrad_patches",
     "megatron.optimizer.precision_aware_turbo_mxfp8": "primus.backends.megatron.patches.optimizer_patches",
+    "megatron.moe.permute_fusion": "primus.backends.megatron.patches.moe_patches.permute_fusion_patches",
+    "megatron.transformer.mla_rope_fused_mx": "primus.backends.megatron.patches.mla_rope_fused_mx_patches",
 }
 
 _EXTENSION = "primus.backends.megatron.core.extensions.primus_turbo"
-_SWITCH_ENVS = ("PRIMUS_MXFP8_FUSED_NORM", "PRIMUS_TURBO_FUSED_DENSE_MLP", "PRIMUS_TURBO_FUSED_GEMM")
+_SWITCH_ENVS = (
+    "PRIMUS_MXFP8_FUSED_NORM",
+    "PRIMUS_TURBO_FUSED_DENSE_MLP",
+    "PRIMUS_TURBO_FUSED_GEMM",
+    "PRIMUS_TURBO_MLA_ROPE_FUSION",
+)
 
 
 def _ctx(params) -> PatchContext:
