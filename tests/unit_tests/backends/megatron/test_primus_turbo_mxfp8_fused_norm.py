@@ -36,7 +36,6 @@ from primus.backends.megatron.core.extensions.primus_turbo import (  # noqa: E40
     _take_fused_mxfp8_activation,
     attach_fused_mxfp8_activation,
     link_mxfp8_norm_readers,
-    mxfp8_fused_norm_sites,
 )
 
 HAVE_OP = ext._turbo_rmsnorm_mxfp8() is not None
@@ -59,22 +58,6 @@ def _turbo_mxfp8_state(monkeypatch):
     )
     monkeypatch.setattr(ext, "_use_split_wgrad_op", lambda: False)
     monkeypatch.setattr(ext, "get_num_microbatches", lambda: 2)  # the cached-weight + bridge path
-
-
-@pytest.mark.parametrize(
-    "value, sites",
-    [("0", set()), ("", set()), ("1", {"up", "input", "mlp"}), ("all", {"up", "input", "mlp"}), ("up", {"up"}),
-     ("input", {"input"}), ("mlp", {"mlp"}), ("up, input", {"up", "input"})],  # fmt: skip
-)
-def test_sites(monkeypatch, value, sites):
-    monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", value)
-    assert mxfp8_fused_norm_sites() == sites
-
-
-def test_unknown_site_raises(monkeypatch):
-    monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", "up,pre_mlp")
-    with pytest.raises(ValueError, match="pre_mlp"):
-        mxfp8_fused_norm_sites()
 
 
 def test_pair_taken_once_per_reader():

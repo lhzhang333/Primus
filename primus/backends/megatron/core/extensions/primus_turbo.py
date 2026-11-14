@@ -115,6 +115,9 @@ except (ImportError, ModuleNotFoundError):
 from primus.backends.megatron.core.extensions._triton.inplace_add import (
     inplace_add_triton_,
 )
+from primus.backends.megatron.core.extensions.mxfp8_fused_norm_sites import (  # noqa: F401  (re-exported)
+    mxfp8_fused_norm_sites,
+)
 from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import warning_rank_0
 
@@ -258,29 +261,7 @@ def _bridge_activation_grad(
 #   1/all  every site.
 # Taken only when every reader runs Turbo MXFP8 in its own quant context, in the layout the pair is made in.
 _FUSED_MXFP8_ACTIVATION_ATTR = "_primus_fused_mxfp8_activation"
-_MXFP8_FUSED_NORM_SITES = ("up", "input", "mlp")
 _LOGGED_FUSED_MXFP8_SITES = set()
-
-
-def mxfp8_fused_norm_sites() -> frozenset:
-    """The sites PRIMUS_MXFP8_FUSED_NORM switches on: 0 (default), up, input, mlp, a comma list, or 1 / all."""
-    return _parse_mxfp8_fused_norm_sites(os.environ.get("PRIMUS_MXFP8_FUSED_NORM", "0"))
-
-
-@lru_cache(maxsize=16)
-def _parse_mxfp8_fused_norm_sites(raw: str) -> frozenset:
-    value = raw.strip().lower()
-    if value in ("", "0", "off", "false", "no"):
-        return frozenset()
-    if value in ("1", "all", "on", "true", "yes"):
-        return frozenset(_MXFP8_FUSED_NORM_SITES)
-    sites = frozenset(s.strip() for s in value.split(",") if s.strip())
-    unknown = sites.difference(_MXFP8_FUSED_NORM_SITES)
-    if unknown:
-        raise ValueError(
-            f"PRIMUS_MXFP8_FUSED_NORM: unknown site(s) {sorted(unknown)}; use 0, 1 or a comma list of up, input, mlp"
-        )
-    return sites
 
 
 @lru_cache(maxsize=1)
