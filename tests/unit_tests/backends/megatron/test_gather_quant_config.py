@@ -69,14 +69,37 @@ def test_incompatible_consumer_is_rejected(key, value):
         gather.validate_gather_quant_config(config(**{key: value}))
 
 
-def test_mxfp8_consumer_is_accepted():
-    """Turbo's fused grouped MXFP8 MLP (gfx1250) gathers in its quantizer like the MXFP4 one."""
+def _turbo_grouped_mlp_fp8(monkeypatch, **attrs):
+    """A stand-in for Primus-Turbo's ``ops.grouped_mlp_fp8`` module, with ``attrs``."""
+    module = ModuleType("primus_turbo.pytorch.ops.grouped_mlp_fp8")
+    module.__dict__.update(attrs)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
+def test_mxfp8_consumer_is_accepted(monkeypatch):
+    """Turbo's fused grouped MXFP8 MLP (gfx1250) gathers in its quantizer like the MXFP4 one, when it says so."""
+    _turbo_grouped_mlp_fp8(monkeypatch, CONSUMES_PERMUTE_SEAM_MXFP8=True)
     mx8 = config(fp4=None, fp4_recipe=None, fp8="e4m3", fp8_recipe="mxfp8")
     assert gather.validate_gather_quant_config(mx8) == (True, True)
     with pytest.raises(ValueError, match="fp8_recipe"):
         gather.validate_gather_quant_config(
             config(fp4=None, fp4_recipe=None, fp8="e4m3", fp8_recipe="delayed")
         )
+
+
+@pytest.mark.parametrize(
+    "attrs", [{}, {"CONSUMES_PERMUTE_SEAM_MXFP8": False}, None], ids=["no_flag", "false", "no_turbo"]
+)
+def test_mxfp8_needs_a_turbo_that_takes_the_handoff(monkeypatch, attrs):
+    """A Primus-Turbo whose grouped_mlp_fp8 does not take the permute's handoff (CI's pin, upstream main) would
+    quantize the unwritten placeholder: the fusion is refused with MXFP8, and MXFP4 is not asked."""
+    if attrs is None:
+        monkeypatch.setitem(sys.modules, "primus_turbo.pytorch.ops.grouped_mlp_fp8", None)  # not importable
+    else:
+        _turbo_grouped_mlp_fp8(monkeypatch, **attrs)
+    with pytest.raises(ValueError, match="CONSUMES_PERMUTE_SEAM_MXFP8"):
+        gather.validate_gather_quant_config(config(fp4=None, fp4_recipe=None, fp8="e4m3", fp8_recipe="mxfp8"))
+    assert gather.validate_gather_quant_config(config()) == (True, True)  # MXFP4
 
 
 def test_backward_requires_forward():

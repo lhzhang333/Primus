@@ -64,43 +64,43 @@ def _is_silu(activation_func) -> bool:
 
 
 def mega_moe_activation(config: TransformerConfig) -> Optional[GLUActivation]:
-    """The MegaMoE kernel activation for ``config``; ``None`` keeps the kernels' SiLU default.
+    """The MegaMoE kernel activation for ``config``, one rule for both expert flavours (bf16 and mxfp8) on
+    every arch; ``None`` keeps the kernels' default, SiLU-SwiGLU with the gate and ``up`` both clamped to
+    [-10, 10].
 
-    ``quick_gelu`` is Megatron's ``quick_geglu``: ``g * sigmoid(1.702 g) * (u + glu_linear_offset)``
-    with the gate clamped from above only and ``up`` on both sides by ``activation_func_clamp_value``
-    (``moe/experts.py``), which is MiniMax-M3's ``swigluoai``.
+    - SiLU without ``activation_func_clamp_value`` is the plain SwiGLU Megatron computes,
+      ``silu(g) * (u + glu_linear_offset)`` (DeepSeek-V3's, offset 0): no clamp at all (a bound left None
+      costs the kernels no instruction) and the configured offset.
+    - SiLU with ``activation_func_clamp_value`` set keeps the default, whatever the value: DeepSeek-V4 runs
+      MegaMoE with a SiLU config that sets 10, and honouring it would change that model's numerics. Megatron
+      clamps that gate from above only, so at 10 the two differ only for a gate below -10, whose SiLU and its
+      slope are under 5e-4 in magnitude. The default has no offset, so such a config must not set one.
+    - ``quick_gelu`` is Megatron's ``quick_geglu``: ``g * sigmoid(1.702 g) * (u + glu_linear_offset)`` with
+      the gate clamped from above only and ``up`` on both sides by ``activation_func_clamp_value``
+      (``moe/experts.py``), which is MiniMax-M3's and GPT-OSS's ``swigluoai``.
 
-    SiLU always gets the default, whatever ``activation_func_clamp_value`` says: DeepSeek-V4 runs
-    MegaMoE with a SiLU config that sets it, and honouring it would change that model's numerics.
+    Which of these a kernel computes is Primus-Turbo's call, and it raises on the others: gfx1250's MXFP8
+    stages, for one, take SiLU-SwiGLU without an offset, unclamped or with Megatron's clamp.
     """
+    offset = float(config.glu_linear_offset)
+    limit = config.activation_func_clamp_value
     if _is_silu(config.activation_func):
+        if limit is None:
+            return GLUActivation(glu_offset=offset, gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None)
+        if offset:
+            raise ValueError(
+                "MegaMoE: a SiLU config with activation_func_clamp_value set runs the kernels' clamped "
+                f"SwiGLU, which has no glu_linear_offset; got glu_linear_offset={offset}"
+            )
         return None
     assert config.activation_func is quick_gelu, f"no MegaMoE activation for {config.activation_func!r}"
-    limit = config.activation_func_clamp_value
     return GLUActivation(
         alpha=_QUICK_GELU_ALPHA,
-        glu_offset=float(config.glu_linear_offset),
+        glu_offset=offset,
         gate_clamp_lo=None,
         gate_clamp_hi=limit,
         up_clamp=limit,
     )
-
-
-def mega_moe_exact_activation(config: TransformerConfig) -> Optional[GLUActivation]:
-    """The expert activation exactly as ``config`` has it, ``activation_func_clamp_value`` included as Megatron's
-    unfused GLU applies it (the gate clamped from above, up on both sides): what gfx1250's MXFP8 stages take.
-    ``mega_moe_activation`` gives SiLU the kernels' default instead, which clamps both halves at +-10, the gate
-    from below too, and so clamps even a plain SwiGLU (DeepSeek-V3's)."""
-    if not _is_silu(config.activation_func):
-        return mega_moe_activation(config)
-    limit = config.activation_func_clamp_value
-    return GLUActivation(gate_clamp_lo=None, gate_clamp_hi=limit, up_clamp=limit)
-
-
-def _on_gfx1250() -> bool:
-    from primus.core.utils.gpu_arch import is_gfx1250
-
-    return is_gfx1250()
 
 
 def mega_moe_precision() -> str:
@@ -310,16 +310,9 @@ class MegaMoEFP8Experts(MegaMoEExperts):
     """MXFP8 sibling: same parameters and same two-stage shape, different stage pair.
 
     The fp8 stages thread an extra opaque ``state`` from stage1 to stage2, which carries the
-    quantized operands that cannot ride autograd's gradient slots.
-
-    On gfx1250 the stages compute the activation exactly as configured (``mega_moe_exact_activation``) and
-    take ``fuse_wgrad_accum_pattern`` (the wgrads add into a bf16 ``main_grad``).
+    quantized operands that cannot ride autograd's gradient slots. They get ``fuse_wgrad_accum_pattern`` (the
+    wgrads add into a bf16 ``main_grad``) when wgrad fusion is on and this Primus-Turbo's mxfp8 stages take it.
     """
-
-    def __init__(self, config: TransformerConfig, *args, **kwargs) -> None:
-        super().__init__(config, *args, **kwargs)
-        if _on_gfx1250():
-            self.activation = mega_moe_exact_activation(config)
 
     def _wgrad_accum_pattern(self, config: TransformerConfig) -> Optional[str]:
         """``"megatron"`` when DDP's add may be fused and this Primus-Turbo's mxfp8 stages take the pattern

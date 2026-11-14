@@ -31,13 +31,13 @@ def _is_turbo_mega_moe_can_patch(ctx: PatchContext) -> bool:
       - primus_turbo package is installed
       - enable_primus_turbo == True
       - use_turbo_mega_moe == True
-      - 1 < expert_model_parallel_size <= 8, or 1 with turbo_mega_moe_allow_ep1 (tests / bring-up only)
+      - 1 < expert_model_parallel_size <= 8, or 1 with turbo_mega_moe_allow_ep1 (dev only: tests / bring-up)
     """
     args = get_args(ctx)
     use_turbo_mega_moe = bool(getattr(args, "use_turbo_mega_moe", False))
     bf16 = bool(getattr(args, "bf16", False))
     # The fused all-to-all rides intra-node peer transfers, so the EP group has to fit in one node. At EP1 it
-    # has nothing to send and only adds its protocol, so it runs there for tests and bring-up alone.
+    # has nothing to send and only adds its protocol: dev-only turbo_mega_moe_allow_ep1 runs it there anyway.
     ep_size = int(getattr(args, "expert_model_parallel_size", 1))
     ep_ok = 1 < ep_size <= 8 or (ep_size == 1 and bool(getattr(args, "turbo_mega_moe_allow_ep1", False)))
 

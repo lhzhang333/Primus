@@ -54,10 +54,15 @@ use_turbo_fused_qk_rmsnorm_rope: false
 # operator switch
 # use turbo gemm
 use_turbo_gemm: false
+# One pool of dummy wgrads per process (with gradient_accumulation_fusion): TE's linears and the Primus-Turbo
+# linears take theirs from Primus-Turbo's flat dummy-wgrad pool (one buffer per dtype, the largest weight once)
+# instead of one persistent buffer per weight shape each. Needs a Primus-Turbo with that pool
+# (primus_turbo.pytorch.ops.get_dummy_wgrad, DUMMY_WGRAD_FLAT_POOL); a no-op with a warning otherwise.
+turbo_shared_dummy_wgrad: false
 # Fuse the dense SwiGLU MLP chain (fc1 + GLU + fc2) into Primus-Turbo's
 # FlyDSL dense MLP op: MXFP4 mlp_fp4 under fp4, MXFP8 mlp_fp8 (the non-expert
-# MLPs, e.g. DeepSeek-V3's shared experts) under --fp8 e4m3 --fp8_recipe mxfp8.
-# Analog of turbo_fused_grouped_gemm for G=1.
+# MLPs, e.g. DeepSeek-V3's shared experts) under --fp8 e4m3 --fp8_recipe mxfp8
+# on gfx1250 (MI455X) only. Analog of turbo_fused_grouped_gemm for G=1.
 # Default off; Llama-3.1-8B opts in from the experiment YAML.
 turbo_fused_gemm: false
 
@@ -104,8 +109,8 @@ turbo_mega_moe_precision: bf16
 # DDP: off under Megatron-FSDP). null follows gradient_accumulation_fusion; true / false set it for
 # the MegaMoE experts alone.
 turbo_mega_moe_wgrad_accum_fusion: null
-# MegaMoE at EP1 too: tests and bring-up only (one GPU has nothing to send, so the fused op only adds its
-# protocol's cost there). Off: MegaMoE patches in for 1 < EP <= 8 only.
+# DEV ONLY (not for upstream): MegaMoE at EP1 too, for tests and the one-GPU bring-up (one GPU has nothing to
+# send, so the fused op only adds its protocol's cost there). Off: MegaMoE patches in for 1 < EP <= 8 only.
 turbo_mega_moe_allow_ep1: false
 
 # ===== Layer Norm =====
@@ -117,7 +122,8 @@ use_turbo_rms_norm: false
 use_turbo_norm_te_linear: false
 
 # ===== MoE gather quantization =====
-# EP1/TP1 all-to-all with the fused Turbo MXFP4 grouped MLP only.
+# EP1/TP1 all-to-all with the fused Turbo MXFP4 grouped MLP, or the fused MXFP8 one when the
+# installed Primus-Turbo takes the permute's handoff (grouped_mlp_fp8.CONSUMES_PERMUTE_SEAM_MXFP8).
 moe_permute_quant_fusion: false
 moe_backward_permute_quant_fusion: false
 # Preserve activation storage across identity expert sorting.

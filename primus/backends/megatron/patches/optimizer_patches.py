@@ -204,13 +204,25 @@ def _turbo_mxfp8_keeps_te_master_weights(config) -> bool:
     """Whether an optimizer config of a Primus-Turbo MXFP8 run keeps the precision-aware optimizer's
     TE-managed master weights (FusedAdam ``master_weights`` + ``decoupled_grad``), as a run without FP8 does.
 
-    Upstream switches to MCore-managed FP32 master params for every FP8 recipe but delayed scaling, because
-    FP8 *primary* weights (``--fp8-param-gather``) need it. With MXFP8 quantized inside Primus-Turbo's
-    autograd functions the parameters stay BF16, so that switch only changes the optimizer's rounding: on the
-    DSv3 proxy an MXFP8 run whose every GEMM was BF16 matched the BF16 run's gradients bitwise for two
-    iterations and drifted from the second optimizer step on (2026-11-11).
+    Megatron's ``use_precision_aware_optimizer_no_fp8_or_ds_fp8`` is False for every FP8 recipe but delayed
+    scaling (with FP32 ``main_params_dtype``): MCore then keeps FP32 master params, which FP8 *primary* weights
+    (``--fp8-param-gather``) need. Primus-Turbo quantizes MXFP8 inside its GEMMs' autograd functions and the
+    parameters stay BF16, so for such a run the switch changes the optimizer's numerics and nothing else.
     """
     return bool(config.use_precision_aware_optimizer and config.fp8_recipe == "mxfp8")
+
+
+def _precision_aware_turbo_mxfp8_condition(ctx: PatchContext) -> bool:
+    """The precision-aware optimizer under MXFP8 with BF16 primary weights (no ``--fp8-param-gather``) whose
+    GEMMs Primus-Turbo quantizes, on gfx1250 (where MXFP8 runs through Primus-Turbo only). Any other run, TE's
+    MXFP8 on gfx950 included, keeps Megatron's behaviour. The arch is probed last."""
+    from primus.backends.megatron.patches.turbo.utils import turbo_quantizes_mxfp8
+    from primus.core.utils.gpu_arch import is_gfx1250
+
+    args = get_args(ctx)
+    if not getattr(args, "use_precision_aware_optimizer", False) or getattr(args, "fp8_param_gather", False):
+        return False
+    return turbo_quantizes_mxfp8(args) and is_gfx1250()
 
 
 @register_patch(
@@ -218,16 +230,11 @@ def _turbo_mxfp8_keeps_te_master_weights(config) -> bool:
     backend="megatron",
     phase="before_train",
     description=(
-        "Keep the precision-aware optimizer's TE-managed master weights for MXFP8 with BF16 primary "
-        "weights (no --fp8-param-gather), as without FP8."
+        "Keep the precision-aware optimizer's TE-managed master weights for Primus-Turbo MXFP8 on gfx1250 "
+        "with BF16 primary weights (no --fp8-param-gather), as without FP8."
     ),
     priority=35,
-    condition=lambda ctx: (
-        getattr(get_args(ctx), "use_precision_aware_optimizer", False)
-        and getattr(get_args(ctx), "fp8", None) is not None
-        and getattr(get_args(ctx), "fp8_recipe", None) == "mxfp8"
-        and not getattr(get_args(ctx), "fp8_param_gather", False)
-    ),
+    condition=_precision_aware_turbo_mxfp8_condition,
 )
 def patch_precision_aware_for_turbo_mxfp8(ctx: PatchContext):
     """MXFP8 with BF16 primary weights: ``use_precision_aware_optimizer_no_fp8_or_ds_fp8`` stays True."""

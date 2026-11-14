@@ -14,10 +14,12 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import NamedTuple, Optional
 
 import megatron.training
 import pytest
 import torch
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.router import InferenceTopKRouter
@@ -30,6 +32,16 @@ from primus.backends.megatron.core.transformer.moe.router import PrimusTopKRoute
 TopKRouter = PrimusTopKRouter.__bases__[0]
 
 _MEGA_MOE = Path(__file__).resolve().parents[4] / "primus/backends/megatron/core/extensions/mega_moe.py"
+
+
+class _GLUActivation(NamedTuple):
+    """Primus-Turbo's ``GLUActivation``, fields and defaults (SiLU-SwiGLU, both halves clamped to +-10)."""
+
+    alpha: float = 1.0
+    glu_offset: float = 0.0
+    gate_clamp_lo: Optional[float] = -10.0
+    gate_clamp_hi: Optional[float] = 10.0
+    up_clamp: Optional[float] = 10.0
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +59,7 @@ def mega_moe():
                 package.__path__ = []
                 mp.setitem(sys.modules, name, package)
         ops = ModuleType("primus_turbo.pytorch.ops.moe.fused_mega_moe")
-        ops.GLUActivation = object
+        ops.GLUActivation = _GLUActivation
         ops.fused_mega_moe_stage1 = ops.fused_mega_moe_stage2 = None
         fp8_ops = ModuleType("primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8")
         fp8_ops.fused_mega_moe_fp8_stage1 = fp8_ops.fused_mega_moe_fp8_stage2 = None
@@ -95,7 +107,7 @@ def _stub_shared_experts(record):
     return build
 
 
-def _config(shared_expert=True):
+def _config(shared_expert=True, activation_func=torch.nn.functional.silu, **overrides):
     return TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -105,11 +117,12 @@ def _config(shared_expert=True):
         moe_router_topk=2,
         moe_shared_expert_intermediate_size=8 if shared_expert else None,
         gated_linear_unit=True,
-        activation_func=torch.nn.functional.silu,
+        activation_func=activation_func,
         add_bias_linear=False,
         params_dtype=torch.bfloat16,
         bf16=True,
         use_cpu_initialization=True,
+        **overrides,
     )
 
 
@@ -297,7 +310,6 @@ def test_mxfp8_experts_claim_the_pattern_their_stages_take(mega_moe, args, monke
     monkeypatch.setattr(mega_moe, "fused_mega_moe_stage2", bf16_stages[1])
     monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage1", fp8_stages[0])
     monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage2", fp8_stages[1])
-    monkeypatch.setattr(mega_moe, "_on_gfx1250", lambda: False)  # GLUActivation is a stub here
     args.turbo_mega_moe_wgrad_accum_fusion = True
     mega_moe._turbo_stages_take_wgrad_accum.cache_clear()
     try:
@@ -305,3 +317,77 @@ def test_mxfp8_experts_claim_the_pattern_their_stages_take(mega_moe, args, monke
     finally:
         mega_moe._turbo_stages_take_wgrad_accum.cache_clear()
     assert experts.wgrad_accum_pattern == ("megatron" if takes_pattern else None)
+
+
+# DeepSeek-V3's activation: SiLU on the gate, no activation_func_clamp_value, no glu_linear_offset
+_UNCLAMPED_SWIGLU = _GLUActivation(gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None)
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({}, _UNCLAMPED_SWIGLU),
+        ({"activation_func_clamp_value": 10.0}, None),
+        (
+            {"activation_func": quick_gelu, "glu_linear_offset": 1.0, "activation_func_clamp_value": 7.0},
+            _GLUActivation(alpha=1.702, glu_offset=1.0, gate_clamp_lo=None, gate_clamp_hi=7.0, up_clamp=7.0),
+        ),
+    ],
+    ids=["silu_deepseek_v3", "silu_clamped_deepseek_v4", "quick_geglu_swigluoai"],
+)
+def test_activation_follows_the_config(mega_moe, overrides, expected):
+    """A SiLU config without a clamp is Megatron's plain SwiGLU, so the kernels get no clamp at all (their
+    default, None, clamps both halves at +-10); a clamped SiLU keeps that default (DeepSeek-V4's numerics);
+    ``quick_geglu`` is Megatron's, the gate clamped from above only."""
+    assert mega_moe.mega_moe_activation(_config(**overrides)) == expected
+
+
+def _stages_recording_the_activation(seen):
+    """The bf16 and mxfp8 stage pairs with Primus-Turbo's signatures; each stage2 records its activation."""
+
+    def stage1(x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern=None):
+        return x, topk_weights, ()
+
+    def stage2(
+        l1_out,
+        dispatch_weights,
+        handle,
+        topk_idx,
+        topk_weights,
+        w2,
+        group,
+        activation=None,
+        fc1_bias=None,
+        fc2_bias=None,
+        fuse_wgrad_accum_pattern=None,
+    ):
+        seen.append(activation)
+        return l1_out
+
+    def fp8_stage1(x, topk_idx, topk_weights, w1, group):
+        return x, topk_weights, (), None
+
+    def fp8_stage2(
+        l1, dispatch_weights, handle, state, topk_idx, topk_weights, w2, group, activation=None, **biases
+    ):
+        seen.append(activation)
+        return l1
+
+    return {
+        "fused_mega_moe_stage1": stage1,
+        "fused_mega_moe_stage2": stage2,
+        "fused_mega_moe_fp8_stage1": fp8_stage1,
+        "fused_mega_moe_fp8_stage2": fp8_stage2,
+    }
+
+
+@pytest.mark.parametrize("experts_cls", ["MegaMoEExperts", "MegaMoEFP8Experts"])
+@pytest.mark.parametrize("clamp", [None, 10.0], ids=["deepseek_v3", "deepseek_v4"])
+def test_experts_hand_stage2_the_activation(mega_moe, args, monkeypatch, experts_cls, clamp):
+    """Both expert flavours, which DeepSeek-V4's MoE also builds, give stage2 the config's activation."""
+    seen = []
+    for name, stage in _stages_recording_the_activation(seen).items():
+        monkeypatch.setattr(mega_moe, name, stage)
+    experts = getattr(mega_moe, experts_cls)(_config(activation_func_clamp_value=clamp), 4, 32, 8, _EPGroup())
+    experts(torch.zeros(3, 32, dtype=torch.bfloat16), torch.zeros(3, 2, dtype=torch.long), torch.zeros(3, 2))
+    assert seen == [None if clamp else _UNCLAMPED_SWIGLU]

@@ -25,4 +25,6 @@ def patch_mla_rope_fused_mx(ctx: PatchContext):
     from primus.backends.megatron.core.transformer.mla_rope_fused_mx import install
 
     install(multi_latent_attention)
-    log_rank_0("[Patch:megatron.transformer.mla_rope_fused_mx] MultiLatentAttention.forward -> fused-RoPE MXFP8 path")
+    log_rank_0(
+        "[Patch:megatron.transformer.mla_rope_fused_mx] MultiLatentAttention.forward -> fused-RoPE MXFP8 path"
+    )

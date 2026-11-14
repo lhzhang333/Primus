@@ -1,5 +1,8 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """PRIMUS_MXFP8_FUSED_NORM: RMSNorm outputs handed to Primus-Turbo MXFP8 linears already quantized
 (Primus-Turbo's ``ops.normalization.rmsnorm_mxfp8``).
@@ -36,7 +39,6 @@ from primus.backends.megatron.core.extensions.primus_turbo import (  # noqa: E40
     _take_fused_mxfp8_activation,
     attach_fused_mxfp8_activation,
     link_mxfp8_norm_readers,
-    mxfp8_fused_norm_sites,
 )
 
 HAVE_OP = ext._turbo_rmsnorm_mxfp8() is not None
@@ -61,20 +63,46 @@ def _turbo_mxfp8_state(monkeypatch):
     monkeypatch.setattr(ext, "get_num_microbatches", lambda: 2)  # the cached-weight + bridge path
 
 
-@pytest.mark.parametrize(
-    "value, sites",
-    [("0", set()), ("", set()), ("1", {"up", "input", "mlp"}), ("all", {"up", "input", "mlp"}), ("up", {"up"}),
-     ("input", {"input"}), ("mlp", {"mlp"}), ("up, input", {"up", "input"})],  # fmt: skip
-)
-def test_sites(monkeypatch, value, sites):
-    monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", value)
-    assert mxfp8_fused_norm_sites() == sites
+def test_consumer_memo_keys_on_the_recipe_value(monkeypatch):
+    """Primus' get_fp8_context builds a new quant config per layer forward: the consumer memo must hit on an equal
+    config, not grow by one entry (and one kept config) per forward."""
+    import contextlib
 
+    class Linear:
+        training, offload, te_quant_params = True, False, None
 
-def test_unknown_site_raises(monkeypatch):
-    monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", "up,pre_mlp")
-    with pytest.raises(ValueError, match="pre_mlp"):
-        mxfp8_fused_norm_sites()
+    class Manager:
+        @staticmethod
+        def is_fp8_enabled():
+            return False
+
+        @staticmethod
+        def is_turbo_fp8_enabled():
+            return True
+
+        @staticmethod
+        def is_turbo_fp4_enabled():
+            return False
+
+        @staticmethod
+        def get_turbo_quant_config():  # a new object every call, as get_fp8_context makes it
+            return PrimusTurboQuantConfig(
+                format=Format.E4M3,
+                granularity=ScalingGranularity.MX_BLOCKWISE,
+                block_size=32,
+                scale_dtype=ScaleDtype.E8M0,
+            )
+
+    asked = []
+    monkeypatch.setattr(ext, "PrimusTurboLinear", Linear)
+    monkeypatch.setattr(ext, "PrimusTurboLowPrecisionGlobalStateManager", Manager)
+    monkeypatch.setattr(ext, "_turbo_rmsnorm_mxfp8", lambda: object())
+    monkeypatch.setattr(ext, "_get_fp8_autocast_for_quant_params", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(ext, "_in_mxfp8_linear_context", lambda: asked.append(1) or True)
+    linear = Linear()
+    for _ in range(100):
+        assert ext.can_consume_fused_mxfp8_activation(linear)
+    assert len(asked) == 1 and len(linear._primus_mxfp8_consumer_cache) == 1
 
 
 def test_pair_taken_once_per_reader():
@@ -227,14 +255,22 @@ def _bare(cls):
 
 
 def test_link_only_mla_down_projections():
+    """Linked only when nothing else reads or keeps the norm's output. The checks fail closed: an attribute
+    Megatron always sets but a newer one might rename counts as on."""
     q, kv = _bare(PrimusTurboLinear), _bare(PrimusTurboLinear)
     attn = SimpleNamespace(
         config=SimpleNamespace(q_lora_rank=1536),
         linear_q_down_proj=q,
         linear_kv_down_proj=kv,
         core_attention=None,
+        offload_qkv_linear=False,
     )
-    layer = SimpleNamespace(input_layernorm=PrimusTurboRMSNorm(64).cuda(), self_attention=attn)
+    layer = SimpleNamespace(
+        input_layernorm=PrimusTurboRMSNorm(64).cuda(),
+        self_attention=attn,
+        recompute_input_layernorm=False,
+        offload_attn_norm=False,
+    )
     assert link_mxfp8_norm_readers(layer)
     assert [r() for r in layer.input_layernorm._primus_mxfp8_readers] == [q, kv]
     dsa = SimpleNamespace(requires_dsa_inputs=True)
@@ -246,7 +282,16 @@ def test_link_only_mla_down_projections():
         dict(self_attention=SimpleNamespace(**{**vars(attn), "offload_qkv_linear": True})),
         dict(self_attention=SimpleNamespace(**{**vars(attn), "core_attention": dsa})),
         dict(input_layernorm=torch.nn.LayerNorm(64)),
-    ):  # fmt: skip
+    ):
         other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(), **change})
         assert not link_mxfp8_norm_readers(other), change
         assert not hasattr(other.input_layernorm, "_primus_mxfp8_readers")
+    for missing in ("recompute_input_layernorm", "offload_attn_norm"):
+        other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda()})
+        delattr(other, missing)
+        assert not link_mxfp8_norm_readers(other), missing
+    no_offload_attr = SimpleNamespace(**{k: v for k, v in vars(attn).items() if k != "offload_qkv_linear"})
+    other = SimpleNamespace(
+        **{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(), "self_attention": no_offload_attr}
+    )
+    assert not link_mxfp8_norm_readers(other)

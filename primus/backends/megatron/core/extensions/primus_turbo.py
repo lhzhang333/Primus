@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import os
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -115,14 +114,17 @@ except (ImportError, ModuleNotFoundError):
 from primus.backends.megatron.core.extensions._triton.inplace_add import (
     inplace_add_triton_,
 )
+from primus.backends.megatron.core.extensions.mxfp8_fused_norm_sites import (  # noqa: F401  (re-exported)
+    mxfp8_fused_norm_sites,
+)
 from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import warning_rank_0
 
 _dummy_wgrads = {}
-try:  # one set of dummy wgrad buffers per process, shared with Primus-Turbo's GEMMs (see _get_dummy_wgrad)
-    from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad as _turbo_get_dummy_wgrad
-except ImportError:
-    _turbo_get_dummy_wgrad = None
+# Primus-Turbo's public dummy-wgrad helper, ``get_dummy_wgrad(shape, dtype, zero=False)`` in TE's signature, set by the
+# megatron.te.shared_dummy_wgrad patch (turbo_shared_dummy_wgrad, default off) so that these linears draw on the pool
+# TE's and Primus-Turbo's GEMMs share. None: this module's own buffers (_get_dummy_wgrad).
+_shared_dummy_wgrad = None
 
 # A fused RMSNorm producer attaches raw MXFP4 buffers to its (deliberately
 # unwritten) BF16 autograd carrier. The next ColumnParallelLinear consumes the
@@ -258,29 +260,7 @@ def _bridge_activation_grad(
 #   1/all  every site.
 # Taken only when every reader runs Turbo MXFP8 in its own quant context, in the layout the pair is made in.
 _FUSED_MXFP8_ACTIVATION_ATTR = "_primus_fused_mxfp8_activation"
-_MXFP8_FUSED_NORM_SITES = ("up", "input", "mlp")
 _LOGGED_FUSED_MXFP8_SITES = set()
-
-
-def mxfp8_fused_norm_sites() -> frozenset:
-    """The sites PRIMUS_MXFP8_FUSED_NORM switches on: 0 (default), up, input, mlp, a comma list, or 1 / all."""
-    return _parse_mxfp8_fused_norm_sites(os.environ.get("PRIMUS_MXFP8_FUSED_NORM", "0"))
-
-
-@lru_cache(maxsize=16)
-def _parse_mxfp8_fused_norm_sites(raw: str) -> frozenset:
-    value = raw.strip().lower()
-    if value in ("", "0", "off", "false", "no"):
-        return frozenset()
-    if value in ("1", "all", "on", "true", "yes"):
-        return frozenset(_MXFP8_FUSED_NORM_SITES)
-    sites = frozenset(s.strip() for s in value.split(",") if s.strip())
-    unknown = sites.difference(_MXFP8_FUSED_NORM_SITES)
-    if unknown:
-        raise ValueError(
-            f"PRIMUS_MXFP8_FUSED_NORM: unknown site(s) {sorted(unknown)}; use 0, 1 or a comma list of up, input, mlp"
-        )
-    return sites
 
 
 @lru_cache(maxsize=1)
@@ -298,8 +278,8 @@ def _turbo_rmsnorm_mxfp8():
 def _mxfp8_activation_recipes(weight) -> Tuple[ScalingRecipe, ScalingRecipe]:
     """(row, column) scaling recipes a prequantized MXFP8 input of ``gemm_fp8(a, weight)`` must carry:
     Primus-Turbo's MX GEMM layouts (packed scales; plus 16x16 codes for the column copy, wgrad's B operand)
-    when that GEMM runs on them, raw ones otherwise. ``weight``: the bf16 parameter (its cache is made in the
-    matching layout, see ``_mx_weight_layout_recipe``) or that cached QuantizedTensor (or pair)."""
+    when that GEMM runs on them, raw ones otherwise. ``weight``: the bf16 parameter (Primus-Turbo makes its cache in
+    the matching layout) or that cached QuantizedTensor (or pair)."""
     from primus_turbo.pytorch.ops.utils import MX_A, MX_B, mx_gemm_layout
 
     if PrimusTurboQuantizedTensorPair is not None and isinstance(weight, PrimusTurboQuantizedTensorPair):
@@ -319,7 +299,29 @@ def _in_mxfp8_linear_context() -> bool:
     return (
         config.granularity == ScalingGranularity.MX_BLOCKWISE
         and config.block_size == 32
-        and config.format in (Format.E4M3, Format.HYBRID)
+        and config.format == Format.E4M3
+    )
+
+
+def _quant_recipe_key(quant) -> Optional[tuple]:
+    """The value of a PrimusTurboQuantConfig as a hashable key (None stays None). Primus' ``get_fp8_context``
+    builds a new config object per call, so memos key on this, never on the object."""
+    if quant is None:
+        return None
+    d = quant.data()
+    return (type(d).__name__, d.granularity, d.format, d.block_size, getattr(d, "strategy", None))
+
+
+def _autocast_state_key(module) -> tuple:
+    """What a module's quant decision depends on besides its own (fixed) ``te_quant_params``: train / eval and
+    the surrounding autocast state, the recipe by value."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    return (
+        module.training,
+        manager.is_fp8_enabled(),
+        manager.is_turbo_fp8_enabled(),
+        manager.is_turbo_fp4_enabled(),
+        _quant_recipe_key(manager.get_turbo_quant_config()),
     )
 
 
@@ -334,21 +336,38 @@ def can_consume_fused_mxfp8_activation(module) -> bool:
     # Called from the producer, outside the module's forward: enter its quant context briefly (as the MXFP4
     # probe does) so the answer is this linear's recipe, not the surrounding state. Memoized per module and
     # autocast state (a linear's te_quant_params are fixed once built).
-    manager = PrimusTurboLowPrecisionGlobalStateManager
-    quant = manager.get_turbo_quant_config()
-    key = (
-        module.training,
-        manager.is_fp8_enabled(),
-        manager.is_turbo_fp8_enabled(),
-        manager.is_turbo_fp4_enabled(),
-        None if quant is None else id(quant),
-    )
+    key = _autocast_state_key(module)
     cache = module.__dict__.setdefault("_primus_mxfp8_consumer_cache", {})
     hit = cache.get(key)
     if hit is None:
         with _get_fp8_autocast_for_quant_params(module.te_quant_params, module.training):
-            hit = cache[key] = (quant, _in_mxfp8_linear_context())  # (keeps ``quant`` alive: its id is in the key)
-    return hit[1]
+            hit = cache[key] = _in_mxfp8_linear_context()
+    return hit
+
+
+def _turbo_mxfp8_quant(linear):
+    """The Turbo MXFP8 quant config ``linear`` runs under here (its ``te_quant_params`` over the current autocast),
+    else None."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    with _get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
+        quant = manager.get_turbo_quant_config() if manager.is_turbo_fp8_enabled() else None
+        return quant if quant is not None and quant.mxfp8_scaling() else None
+
+
+def _dense_mlp_routes_to_mlp_fp8(mlp) -> bool:
+    """Whether this forward of a Megatron MLP the dense MLP MXFP8 patch enabled takes Primus-Turbo's ``mlp_fp8``:
+    both linears under the same Turbo MXFP8 recipe here. Memoized per module and autocast state (the linears'
+    ``te_quant_params`` are fixed once built)."""
+    if _use_split_wgrad_op():
+        return False
+    key = _autocast_state_key(mlp)
+    cache = mlp.__dict__.setdefault("_turbo_dense_mlp_mxfp8_route", {})
+    route = cache.get(key)
+    if route is None:
+        q1, q2 = _turbo_mxfp8_quant(mlp.linear_fc1), _turbo_mxfp8_quant(mlp.linear_fc2)
+        route = q1 is not None and q2 is not None and _quant_recipe_key(q1) == _quant_recipe_key(q2)
+        cache[key] = route
+    return route
 
 
 def attach_fused_mxfp8_activation(carrier: torch.Tensor, pair, readers: int) -> None:
@@ -447,6 +466,20 @@ def _nan_scalar(dtype, device) -> torch.Tensor:
     return t
 
 
+_MISSING = object()
+
+
+def _set_and_off(obj, *names) -> bool:
+    """Whether every attribute ``names`` of ``obj`` exists and is false. The link checks fail closed on the
+    attributes Megatron always sets (TransformerLayer, attention, MoELayer): one a newer Megatron renamed counts
+    as on, so a norm is never linked in a configuration the checks exist to exclude."""
+    for name in names:
+        value = getattr(obj, name, _MISSING)
+        if value is _MISSING or value:
+            return False
+    return True
+
+
 def link_mxfp8_norm_readers(layer) -> bool:
     """Site ``input``: link a TransformerLayer's input RMSNorm to its only readers, MLA's q / kv down
     projections (Megatron's ``_qkv_down_projection``), when both are Primus-Turbo linears and nothing else
@@ -461,10 +494,11 @@ def link_mxfp8_norm_readers(layer) -> bool:
         return False
     if not all(isinstance(r, PrimusTurboLinear) for r in readers):
         return False
-    if getattr(layer, "recompute_input_layernorm", False) or getattr(layer, "offload_attn_norm", False):
+    if not _set_and_off(layer, "recompute_input_layernorm", "offload_attn_norm"):
         return False
-    if getattr(attn, "offload_qkv_linear", False):
+    if not _set_and_off(attn, "offload_qkv_linear"):
         return False
+    # only DSA's core attention defines it; Megatron's MLA reads it with the same default
     if getattr(getattr(attn, "core_attention", None), "requires_dsa_inputs", False):
         return False
     norm._primus_mxfp8_readers = tuple(weakref.ref(r) for r in readers)
@@ -478,12 +512,8 @@ def _fused_rmsnorm_mxfp8_mlp(norm, x: torch.Tensor, gamma: torch.Tensor):
     ref = getattr(norm, "_primus_mxfp8_mlp_reader", None)
     if ref is None or "mlp" not in mxfp8_fused_norm_sites():
         return None
-    from primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches import (
-        _routes_here,
-    )
-
     rmsnorm_mxfp8, mlp = _turbo_rmsnorm_mxfp8(), ref()
-    if rmsnorm_mxfp8 is None or mlp is None or _use_split_wgrad_op() or not _routes_here(mlp):
+    if rmsnorm_mxfp8 is None or mlp is None or _use_split_wgrad_op() or not _dense_mlp_routes_to_mlp_fp8(mlp):
         return None
     row_recipe, col_recipe = _mxfp8_activation_recipes(mlp.linear_fc1._parameters["weight"])
     y, pair = rmsnorm_mxfp8(x, gamma, norm.eps, write_y=True, row_recipe=row_recipe, col_recipe=col_recipe)
@@ -503,9 +533,9 @@ def link_mxfp8_mlp_norm_reader(layer) -> bool:
         return False
     if not getattr(shared, "_turbo_dense_mlp_mxfp8", False):
         return False
-    if getattr(mlp, "shared_expert_overlap", False) or getattr(mlp, "shared_experts_recompute", False):
+    if not _set_and_off(mlp, "shared_expert_overlap", "shared_experts_recompute"):
         return False
-    if getattr(layer, "recompute_pre_mlp_layernorm", False) or getattr(layer, "offload_mlp_norm", False):
+    if not _set_and_off(layer, "recompute_pre_mlp_layernorm", "offload_mlp_norm"):
         return False
     norm._primus_mxfp8_mlp_reader = weakref.ref(shared)
     return True
@@ -589,21 +619,32 @@ def _bf16_grouped_wgrad_can_accumulate() -> bool:
 def _mxfp8_wgrad_can_accumulate(weight: torch.Tensor) -> bool:
     """Whether the MXFP8 wgrad of ``weight`` may add straight into its ``main_grad`` (beta=1).
 
-    Only for a bf16 weight with a bf16 main_grad (``main_grads_dtype: bf16``), and only when the installed
-    Primus-Turbo says the MXFP8 wgrad backend it would run (dense for a 2-D weight, grouped for the 3-D expert
-    stack; a pinned FP8 backend included) has a beta=1 epilogue for that dtype. A Primus-Turbo that cannot be
-    asked keeps the framework's separate add, so main_grad is never written by a GEMM that would overwrite it.
+    Only on gfx1250, for a bf16 weight with a bf16 main_grad (``main_grads_dtype: bf16``), and only when the
+    installed Primus-Turbo says the MXFP8 wgrad backend it would run (dense for a 2-D weight, grouped for the 3-D
+    expert stack; a pinned FP8 backend included) has a beta=1 epilogue for that dtype
+    (:func:`_mx_wgrad_accum_supported`). A Primus-Turbo that cannot be asked keeps the framework's separate add, so
+    main_grad is never written by a GEMM that would overwrite it.
     """
     main_grad = getattr(weight, "main_grad", None)
     if weight.dtype != torch.bfloat16 or not isinstance(main_grad, torch.Tensor):
         return False
     if main_grad.dtype != torch.bfloat16:
         return False
+    return _mx_wgrad_accum_supported(weight.dim() == 3, main_grad.dtype)
+
+
+@lru_cache(maxsize=None)
+def _mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+    """Primus-Turbo's ``mx_wgrad_accum_supported``, on gfx1250 only, asked once per (grouped, dtype) and process:
+    the linears publish the GEMM backends at construction, before their first forward asks. Elsewhere (gfx950's
+    MXFP8 GEMMs have the epilogue too) the separate add stays, so no other arch's rounding changes."""
+    if not _is_gfx1250():
+        return False
     try:
         from primus_turbo.pytorch.ops import mx_wgrad_accum_supported
     except ImportError:
         return False
-    return bool(mx_wgrad_accum_supported(weight.dim() == 3, main_grad.dtype))
+    return bool(mx_wgrad_accum_supported(grouped, main_grad_dtype))
 
 
 def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
@@ -614,13 +655,12 @@ def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tenso
     Tensors are cached by ``(shape, dtype)`` so each distinct weight layout
     only allocates one persistent buffer that gets reused across steps.
 
-    The buffers are Primus-Turbo's own (``primus_turbo.pytorch.ops.utils._get_dummy_wgrad``) when it has
-    them: with wgrad accumulation fused, the Turbo GEMM under :func:`_bridge_weight_grad` already returned a
-    dummy of the same shape and dtype, and a second persistent copy here would double the cost (2.6 GiB per
-    process for DeepSeek-V3's 32-expert stacks). The contents are never read.
+    With ``turbo_shared_dummy_wgrad`` they come from Primus-Turbo's pool instead (``_shared_dummy_wgrad``): with
+    wgrad accumulation fused, the Turbo GEMM under :func:`_bridge_weight_grad` already returned a dummy of the
+    same shape and dtype, so a second persistent buffer here doubles what the dummies cost.
     """
-    if _turbo_get_dummy_wgrad is not None:
-        return _turbo_get_dummy_wgrad(list(shape), dtype, zero=zero)
+    if _shared_dummy_wgrad is not None:
+        return _shared_dummy_wgrad(list(shape), dtype, zero=zero)
     global _dummy_wgrads
     key = (tuple(shape), dtype)
     if key not in _dummy_wgrads:
@@ -666,7 +706,7 @@ def _bridge_weight_grad(
             ctx.save_for_backward(weight)
             # The GEMMs return no gradient for the transpose copy (an operand of their backward only), and
             # backward ignores it: without this, autograd would hand backward a materialized zero tensor of
-            # the full weight shape for it on every microbatch (1.75 GiB + a memset for a DeepSeek-V3 expert fc1).
+            # the full weight shape for it on every microbatch (an allocation and a memset of the whole weight).
             ctx.set_materialize_grads(False)
             return x, quantized_weight, quantized_weight_trans
 
@@ -692,12 +732,12 @@ def _bridge_weight_grad(
                 # the dummy wgrad returned below means they are not recoverable from
                 # param.grad either. The fused path above is immune because its beta=1
                 # epilogue accumulates on every microbatch regardless of the flag.
-                if grad_quantized_weight is None:  # set_materialize_grads(False): no gradient reached it
-                    pass
-                elif _is_gfx1250():
-                    inplace_add_triton_(weight.main_grad, grad_quantized_weight)
-                else:
-                    weight.main_grad.add_(grad_quantized_weight)
+                # set_materialize_grads(False): None when no gradient reached the copy
+                if grad_quantized_weight is not None:
+                    if _is_gfx1250():
+                        inplace_add_triton_(weight.main_grad, grad_quantized_weight)
+                    else:
+                        weight.main_grad.add_(grad_quantized_weight)
                 weight.grad_added_to_main_grad = True
 
             return grad_x, _get_dummy_wgrad(list(weight.shape), weight.dtype), None, None
@@ -807,34 +847,6 @@ def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantCon
     return ScalingRecipe()
 
 
-def _mx_weight_layout_recipe(
-    quant_config: Union[Float4QuantConfig, Float8QuantConfig], weight: torch.Tensor
-) -> Optional[ScalingRecipe]:
-    """Recipe of the cached MXFP8 copies of ``weight`` on gfx1250, whose FlyDSL GEMMs read their own layout (E8M0
-    scales packed as ``[rows/32][K/128][32][4]``, codes in 16x16-preshuffled tiles): Primus-Turbo's
-    ``mx_weight_layout_recipe(grouped, shape)``, which returns that layout only once the backend of the op kind --
-    dense (a 2-D weight) or grouped / the fused grouped MLP (the 3-D expert stack) -- consumes it, and only for a
-    shape it fits. ``None`` (Turbo's default, raw layout): other archs or recipes, or a Primus-Turbo without the
-    query."""
-    if not (
-        isinstance(quant_config, Float8QuantConfig)
-        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
-        and _is_gfx1250()
-    ):
-        return None
-    query = getattr(primus_turbo_torch.ops, "mx_weight_layout_recipe", None)
-    return None if query is None else query(weight.dim() == 3, shape=tuple(weight.shape))
-
-
-@lru_cache(maxsize=None)
-def _takes_scaling_recipe(fn) -> bool:
-    """Whether Primus-Turbo's ``create_quantized_weight`` takes a ``scaling_recipe`` (newer builds)."""
-    try:
-        return "scaling_recipe" in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def _not_leaves(*copies):
     """The cached quantized copies of a weight, as tensors that do not require grad (anything else, such as a
     missing transpose copy, passes through unchanged).
@@ -844,11 +856,10 @@ def _not_leaves(*copies):
     into the graph (the bridge's outputs need no such leaf: they require grad through ``weight``). Megatron's
     token dispatcher keeps the last microbatch's ``probs`` (and so that graph) until the layer's next forward,
     so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
-    step's first microbatch: 3 x 2.7 GiB on top of the new caches at the DeepSeek-V3 proxy's allocation peak.
+    step's first microbatch. ``detach`` (same storage) rather than ``requires_grad_(False)``, which raises on a
+    copy that is a view with a grad_fn (a TENSORWISE transpose copy is one).
     """
-    return tuple(
-        c.requires_grad_(False) if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies
-    )
+    return tuple(c.detach() if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies)
 
 
 def _maybe_create_quantized_weight_buffers(
@@ -861,9 +872,8 @@ def _maybe_create_quantized_weight_buffers(
     (colwise) buffer, returning ``(rowwise, colwise_or_None)``.
 
     Prefers primus_turbo's ``create_quantized_weight`` helper, which picks the
-    scaling recipe from the quant config and handles per-granularity transpose;
-    it is handed the recipe of :func:`_mx_weight_layout_recipe` when there is one
-    and it takes a ``scaling_recipe``.
+    scaling recipe from the quant config and handles per-granularity transpose
+    (an MXFP8 weight on gfx1250: the layout its GEMMs read there).
     Falls back to a manual rowwise/colwise quantize on older primus_turbo builds
     that do not export ``create_quantized_weight`` yet.
     """
@@ -871,17 +881,12 @@ def _maybe_create_quantized_weight_buffers(
     need_weight_transpose_cache = not disable_parameter_transpose_cache
 
     if create_quantized_weight is not None:
-        kwargs = {}
-        recipe = _mx_weight_layout_recipe(quant_config_internal, weight)
-        if recipe is not None and _takes_scaling_recipe(create_quantized_weight):
-            kwargs["scaling_recipe"] = recipe
         return _not_leaves(
             *create_quantized_weight(
                 weight,
                 dest_dtype,
                 quant_config_internal,
                 need_weight_transpose_cache=need_weight_transpose_cache,
-                **kwargs,
             )
         )
 

@@ -1,8 +1,11 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """The dense MXFP8 SwiGLU MLP patch (``dense_mlp_mxfp8_patches``): which MLPs it routes to Primus-Turbo's
-``mlp_fp8`` (CPU), and on gfx1250 the routed forward / backward against today's path (the Turbo MX linears around
+``mlp_fp8`` (CPU), and on gfx1250 the routed forward / backward against the unrouted path (the Turbo MX linears around
 Megatron's SwiGLU): bitwise when that SwiGLU computes the fused kernels' bf16 values, within the activation's
 rounding otherwise; cached weights and the wgrads fused into a bf16 main_grad, one and two micro-batches."""
 
@@ -27,8 +30,14 @@ class _Fc2:
 
 
 def _cfg(**kw):
-    base = dict(gated_linear_unit=True, activation_func=F.silu, add_bias_linear=False, use_te_activation_func=False,
-                glu_linear_offset=0.0, activation_func_clamp_value=None)  # fmt: skip
+    base = dict(
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        use_te_activation_func=False,
+        glu_linear_offset=0.0,
+        activation_func_clamp_value=None,
+    )
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -44,6 +53,7 @@ def stub_types(monkeypatch):
     monkeypatch.delenv("PRIMUS_TURBO_FUSED_GEMM", raising=False)
     monkeypatch.setattr(patch, "_turbo_linear_types", lambda: ((_Fc1,), (_Fc2,)))
     monkeypatch.setattr(patch, "_mlp_fp8_op", lambda: object())
+    monkeypatch.setattr(patch, "is_gfx1250", lambda: True)
 
 
 def _mlp(cfg=None, fc1=None, fc2=None):
@@ -68,6 +78,7 @@ def test_enabled_for_a_shared_expert_mlp(stub_types):
         ({}, dict(use_te_activation_func=True), False, {}),
         ({}, dict(glu_linear_offset=1.0), False, {}),
         ({}, dict(activation_func_clamp_value=7.0), False, {}),
+        ({}, dict(layernorm_zero_centered_gamma=True), False, {}),  # the fc1-fused norm would miss the +1
         ({}, {}, False, dict(fc1=torch.nn.Linear(2, 2))),  # not a Turbo linear
         ({}, {}, False, dict(fc2=torch.nn.Linear(2, 2))),
     ],
@@ -80,6 +91,19 @@ def test_env_switch_overrides_the_arg(stub_types, monkeypatch):
     monkeypatch.setenv("PRIMUS_TURBO_FUSED_DENSE_MLP", "1")
     assert patch._should_enable(_mlp(), _args(turbo_fused_gemm=False), is_expert=False)
     monkeypatch.setenv("PRIMUS_TURBO_FUSED_DENSE_MLP", "0")
+    assert not patch._should_enable(_mlp(), _args(), is_expert=False)
+
+
+def test_gfx1250_only(stub_types, monkeypatch):
+    """mlp_fp8 runs on gfx1250 alone: elsewhere neither the patch nor a module takes it, whatever the switch."""
+    from primus.core.patches import PatchContext
+
+    ctx = PatchContext(
+        backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=_args())}
+    )
+    assert patch._patch_condition(ctx)
+    monkeypatch.setattr(patch, "is_gfx1250", lambda: False)
+    assert not patch._patch_condition(ctx)
     assert not patch._should_enable(_mlp(), _args(), is_expert=False)
 
 
@@ -108,18 +132,29 @@ class _Manager:
         return cls.QUANT
 
 
-@pytest.mark.parametrize("fc1_recipe, fc2_recipe, want", [("mx", "mx", True), (None, "mx", False),
-                                                          ("mx", None, False), ("mx", "mx2", False)])  # fmt: skip
+def _import_ext_or_skip():
+    """The Primus-Turbo extension: its import needs Primus-Turbo, which initializes CUDA on import."""
+    try:
+        import primus.backends.megatron.core.extensions.primus_turbo as ext
+    except Exception as e:  # noqa: BLE001 - RuntimeError on a GPU-less host, ImportError without Turbo
+        pytest.skip(f"the Primus-Turbo extension does not import here: {type(e).__name__}")
+    return ext
+
+
+@pytest.mark.parametrize(
+    "fc1_recipe, fc2_recipe, want",
+    [("mx", "mx", True), (None, "mx", False), ("mx", None, False), ("mx", "mx2", False)],
+)
 def test_route_per_forward(monkeypatch, fc1_recipe, fc2_recipe, want):
-    """Both linears under the same Turbo MXFP8 recipe here (else a BF16 match): memoized per autocast state."""
-    ext = SimpleNamespace(
-        _use_split_wgrad_op=lambda: False, PrimusTurboLowPrecisionGlobalStateManager=_Manager
-    )
-    monkeypatch.setattr(patch, "_ext", lambda: ext)
-    monkeypatch.setattr(patch, "_recipe_key", lambda q: q)
+    """Both linears under the same Turbo MXFP8 recipe here (else a BF16 match): memoized per autocast state, the
+    recipe by value (a new but equal config object per forward hits the memo)."""
+    ext = _import_ext_or_skip()
+    monkeypatch.setattr(ext, "PrimusTurboLowPrecisionGlobalStateManager", _Manager)
+    monkeypatch.setattr(ext, "_use_split_wgrad_op", lambda: False)
+    monkeypatch.setattr(ext, "_quant_recipe_key", lambda q: q)
     asked = []
     recipes = {"fc1": fc1_recipe, "fc2": fc2_recipe}
-    monkeypatch.setattr(patch, "_turbo_mxfp8", lambda lin: asked.append(lin) or recipes[lin])
+    monkeypatch.setattr(ext, "_turbo_mxfp8_quant", lambda lin: asked.append(lin) or recipes[lin])
     mlp = SimpleNamespace(training=True, linear_fc1="fc1", linear_fc2="fc2")
     assert patch._routes_here(mlp) is want and patch._routes_here(mlp) is want
     assert asked == ["fc1", "fc2"], "the decision is memoized per autocast state"
@@ -136,8 +171,9 @@ gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="gfx1250 MXFP8 mo
 
 
 def _ext_or_skip():
-    import primus.backends.megatron.core.extensions.primus_turbo as ext
     from primus_turbo.pytorch.core.utils import is_gfx1250
+
+    import primus.backends.megatron.core.extensions.primus_turbo as ext
 
     if not is_gfx1250() or patch._mlp_fp8_op() is None:
         pytest.skip("needs gfx1250 and Primus-Turbo's mlp_fp8")
@@ -150,8 +186,12 @@ def mx_state(monkeypatch):
     manager = ext.PrimusTurboLowPrecisionGlobalStateManager
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP4_ENABLED", False)
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP8_ENABLED", True)
-    quant = ext.PrimusTurboQuantConfig(format=ext.Format.E4M3, granularity=ext.ScalingGranularity.MX_BLOCKWISE,
-                                       block_size=32, scale_dtype=ext.ScaleDtype.E8M0)  # fmt: skip
+    quant = ext.PrimusTurboQuantConfig(
+        format=ext.Format.E4M3,
+        granularity=ext.ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ext.ScaleDtype.E8M0,
+    )
     monkeypatch.setattr(manager, "PRIMUS_TURBO_QUANT_CONFIG", quant)
     monkeypatch.setattr(ext, "_use_split_wgrad_op", lambda: False)
     return ext
@@ -174,10 +214,20 @@ def _linear(n, k, seed, main_grad_dtype):
     w.main_grad = (0.01 * _randn(n, k, seed=seed + 100).float()).to(main_grad_dtype)
     w.grad_added_to_main_grad = False
     config = SimpleNamespace(gradient_accumulation_fusion=True, normalization="RMSNorm")
-    return _Stub(_parameters={"weight": w}, use_bias=False, offload=False, config=config,
-                 disable_parameter_transpose_cache=False, quantized_weight_buffer=None, quantized_weight_t_buffer=None,
-                 te_quant_params=None, training=True, is_first_microbatch=True, _forward_pre_hooks={},
-                 _forward_pre_hooks_with_kwargs={})  # fmt: skip
+    return _Stub(
+        _parameters={"weight": w},
+        use_bias=False,
+        offload=False,
+        config=config,
+        disable_parameter_transpose_cache=False,
+        quantized_weight_buffer=None,
+        quantized_weight_t_buffer=None,
+        te_quant_params=None,
+        training=True,
+        is_first_microbatch=True,
+        _forward_pre_hooks={},
+        _forward_pre_hooks_with_kwargs={},
+    )
 
 
 class _KernelSwiGLU(torch.autograd.Function):
@@ -210,7 +260,7 @@ def _megatron_swiglu(l1):
 
 
 def _run(ext, routed, swiglu, micro_batches, main_grad_dtype, s, b, h, i):
-    """(out, dx) per micro-batch, then both main_grads: the patched forward, or today's path (the Turbo linears'
+    """(out, dx) per micro-batch, then both main_grads: the patched forward, or the unrouted path (the Turbo linears'
     forward_internal around ``swiglu``)."""
     fc1, fc2 = _linear(2 * i, h, 1, main_grad_dtype), _linear(h, i, 2, main_grad_dtype)
     mlp = _Stub(linear_fc1=fc1, linear_fc2=fc2, config=fc1.config, training=True)
@@ -248,8 +298,8 @@ SHAPES = [(4096, 2, 7168, 2048), (500, 2, 576, 256)]
 @pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("micro_batches", [1, 2])
 @pytest.mark.parametrize("s, b, h, i", SHAPES)
-def test_matches_todays_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_batches, main_grad_dtype):
-    """With the SwiGLU computing the fused kernels' bf16 values, the routed MLP is today's path bit for bit: the same
+def test_matches_the_unrouted_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_batches, main_grad_dtype):
+    """With the SwiGLU computing the fused kernels' bf16 values, the routed MLP is the unrouted path bit for bit: the same
     GEMMs, weight caches and MXFP8 casts (out, dx per micro-batch; both main_grads)."""
     monkeypatch.setattr(mx_state, "get_num_microbatches", lambda: micro_batches)
     got = _run(mx_state, True, None, micro_batches, main_grad_dtype, s, b, h, i)
@@ -261,7 +311,7 @@ def test_matches_todays_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_ba
 @gpu
 @pytest.mark.parametrize("s, b, h, i", SHAPES[:1])
 def test_close_to_megatron_swiglu(mx_state, monkeypatch, s, b, h, i):
-    """Against today's path with Megatron's SwiGLU: its bf16 activation (and dGLU) differ from the fused kernels' by
+    """Against the unrouted path with Megatron's SwiGLU: its bf16 activation (and dGLU) differ from the fused kernels' by
     rounding (an ulp in a few elements), which the MXFP8 casts turn into an occasional one-code change: far below
     the recipe's own error (>= 30 dB between the paths; both ~ the same SNR vs the fp32 math)."""
     monkeypatch.setattr(mx_state, "get_num_microbatches", lambda: 2)
@@ -302,7 +352,9 @@ def test_fused_pre_mlp_norm_bitwise(mx_state, monkeypatch, micro_batches):
             x = _randn(s, b, h, seed=10 + mb).requires_grad_()
             y = mx_state.PrimusTurboRMSNorm.forward(norm, x)
             assert hasattr(y, attr) == fused
-            router = (y.float() * _randn(s, b, h, seed=30 + mb).float()).sum()  # the router / dispatcher read y
+            router = (
+                y.float() * _randn(s, b, h, seed=30 + mb).float()
+            ).sum()  # the router / dispatcher read y
             out, _ = patch._forward_turbo_dense_mlp_mxfp8(mlp, y)
             assert not hasattr(y, attr), "the shared experts did not take the pair"
             (router + (out.float() * _randn(s, b, h, seed=20 + mb).float()).sum()).backward()
