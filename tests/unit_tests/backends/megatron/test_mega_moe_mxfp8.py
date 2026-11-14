@@ -1,16 +1,16 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""MegaMoE's mxfp8 experts as gfx1250 runs them, without a GPU: the test-only EP1 override of the patch, the
-activation exactly as configured (gfx1250's MXFP8 stages compute nothing else), and the wgrad accumulation
-pattern the stages take. The Turbo ops are stubbed; ``GLUActivation`` is Turbo's own class."""
+"""MegaMoE's mxfp8 experts without a GPU: the test-only EP1 override of the patch, the activation both expert
+flavours hand their kernels (one rule for every arch and precision), and the wgrad accumulation pattern the
+mxfp8 stages take. The Turbo ops are stubbed; ``GLUActivation`` is Turbo's own class. Collects on a GPU-less host:
+nothing here imports ``megatron.training`` (its import pulls in aiter, which probes the GPU)."""
 
 import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-import megatron.training
 import pytest
 import torch
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -69,8 +69,12 @@ def mega_moe(glu):
 
 @pytest.fixture
 def args(monkeypatch):
+    """The Megatron args MegaMoE reads, through a stand-in ``megatron.training`` (the layer imports ``get_args``
+    from it when it needs it)."""
     args = SimpleNamespace(turbo_mega_moe_precision="mxfp8", turbo_mega_moe_wgrad_accum_fusion=None)
-    monkeypatch.setattr(megatron.training, "get_args", lambda: args)
+    training = ModuleType("megatron.training")
+    training.get_args = lambda: args
+    monkeypatch.setitem(sys.modules, "megatron.training", training)
     return args
 
 
@@ -109,19 +113,33 @@ def test_ep1_needs_the_test_override(monkeypatch, ep, allow, want):
     assert P._is_turbo_mega_moe_can_patch(ctx) is want
 
 
-@pytest.mark.parametrize("clamp", [None, 10.0])
-def test_mxfp8_activation_exact_on_gfx1250(mega_moe, glu, args, monkeypatch, clamp):
-    """DeepSeek-V3's plain SwiGLU (no clamp) and Megatron's clamp form (gate from above, up on both sides) reach the
-    gfx1250 MXFP8 stages as such; elsewhere, and for the bf16 experts, the kernels' default (None) stays."""
-    config = _config(activation_func_clamp_value=clamp)
-    monkeypatch.setattr(mega_moe, "_on_gfx1250", lambda: True)
-    want = glu.GLUActivation(1.0, 0.0, None, clamp, clamp)
-    assert _experts(mega_moe, "MegaMoEFP8Experts", config).activation == want
-    assert _experts(mega_moe, "MegaMoEExperts", config).activation is None
-    monkeypatch.setattr(mega_moe, "_on_gfx1250", lambda: False)
-    assert _experts(mega_moe, "MegaMoEFP8Experts", config).activation is None
-    gelu = _config(activation_func=quick_gelu, activation_func_clamp_value=7.0, glu_linear_offset=1.0)
-    assert mega_moe.mega_moe_exact_activation(gelu) == mega_moe.mega_moe_activation(gelu)
+# (config overrides, the GLUActivation fields the kernels get; None = their default, both halves clamped at +-10)
+_ACTIVATIONS = {
+    "deepseek_v3": ({}, (1.0, 0.0, None, None, None)),
+    "silu_offset": ({"glu_linear_offset": 1.0}, (1.0, 1.0, None, None, None)),
+    "deepseek_v4": ({"activation_func_clamp_value": 10.0}, None),
+    "swigluoai": (
+        {"activation_func": quick_gelu, "activation_func_clamp_value": 7.0, "glu_linear_offset": 1.0},
+        (1.702, 1.0, None, 7.0, 7.0),
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_ACTIVATIONS))
+@pytest.mark.parametrize("cls", ["MegaMoEExperts", "MegaMoEFP8Experts"])
+def test_one_activation_rule_for_both_flavours(mega_moe, glu, args, cls, name):
+    """Plain SiLU-SwiGLU (DeepSeek-V3's) reaches the kernels unclamped, with the configured offset; a clamped SiLU
+    keeps the kernels' default (DeepSeek-V4's numerics); quick_geglu is Megatron's. The same for the bf16 and the
+    mxfp8 experts, whatever the arch."""
+    overrides, fields = _ACTIVATIONS[name]
+    want = None if fields is None else glu.GLUActivation(*fields)
+    assert _experts(mega_moe, cls, _config(**overrides)).activation == want
+
+
+def test_clamped_silu_rejects_an_offset(mega_moe, args):
+    """The kernels' clamped SwiGLU has no offset: a SiLU config setting both is refused, not run without it."""
+    with pytest.raises(ValueError, match="glu_linear_offset"):
+        mega_moe.mega_moe_activation(_config(activation_func_clamp_value=10.0, glu_linear_offset=1.0))
 
 
 @pytest.mark.parametrize("stage2_takes", [True, False])

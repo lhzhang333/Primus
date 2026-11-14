@@ -310,7 +310,6 @@ def test_mxfp8_experts_claim_the_pattern_their_stages_take(mega_moe, args, monke
     monkeypatch.setattr(mega_moe, "fused_mega_moe_stage2", bf16_stages[1])
     monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage1", fp8_stages[0])
     monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage2", fp8_stages[1])
-    monkeypatch.setattr(mega_moe, "_on_gfx1250", lambda: False)  # GLUActivation is a stub here
     args.turbo_mega_moe_wgrad_accum_fusion = True
     mega_moe._turbo_stages_take_wgrad_accum.cache_clear()
     try:
