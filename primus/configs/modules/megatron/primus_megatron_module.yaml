@@ -84,6 +84,11 @@ decoder_pipeline_manual_split_list: null # int list
 
 # MoE comm & comp Overlap
 patch_moe_overlap: false
+# MoE all-to-all dispatcher: skip the D2H event wait of a dispatch whose D2H point
+# copied nothing to the host (EP = TP = 1, dropless, fused permute, and
+# tokens_per_expert kept on the device by use_turbo_grouped_gemm). Any host copy
+# keeps the wait. No numerical change.
+moe_skip_idle_dtoh_sync: false
 
 # perf
 pp_warmup: false # set to true to decrease iter-1 time when using pp
