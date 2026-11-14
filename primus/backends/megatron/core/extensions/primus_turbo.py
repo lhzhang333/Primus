@@ -526,7 +526,8 @@ def _maybe_create_quantized_weight_buffers(
     (colwise) buffer, returning ``(rowwise, colwise_or_None)``.
 
     Prefers primus_turbo's ``create_quantized_weight`` helper, which picks the
-    scaling recipe from the quant config and handles per-granularity transpose.
+    scaling recipe from the quant config and handles per-granularity transpose
+    (an MXFP8 weight on gfx1250: the layout its GEMMs read there).
     Falls back to a manual rowwise/colwise quantize on older primus_turbo builds
     that do not export ``create_quantized_weight`` yet.
     """
