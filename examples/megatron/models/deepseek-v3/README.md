@@ -44,6 +44,14 @@ PRIMUS_LAUNCHER=direct bash examples/megatron/models/deepseek-v3/run_deepseek_v3
   auto-tuning if `PRIMUS_TURBO_AUTO_TUNE=1` is exported). Primus sets `PRIMUS_TURBO_GROUPED_GEMM_BACKEND`
   from `TURBO_GROUPED_GEMM_BACKEND` unless that is `default`, so the script refuses an exported
   `PRIMUS_TURBO_GROUPED_GEMM_BACKEND`.
+- `PRIMUS_MXFP8`: MXFP8 training (E4M3 data, one E8M0 scale per 32 values along each GEMM's reduction
+  dimension), quantized by Primus-Turbo (`--fp8 e4m3 --fp8_recipe mxfp8`; TransformerEngine's autocast stays
+  off on gfx1250). Empty or `off` (default): BF16. `experts`: the routed experts (Primus-Turbo grouped GEMMs),
+  the dense linears BF16. `dense`: the MLA and shared-expert linears (`use_turbo_gemm`), the routed experts
+  BF16. `dense_experts`: both. The LM head stays BF16 in every mode. The per-module BF16 overrides are the
+  precision matchers `configs/MI455X/deepseek_v3-MXFP8-bf16-{dense,experts}-te-precision.yaml`
+  (`te_precision_config_file`). Options passed as arguments (e.g. `--turbo_fused_grouped_gemm True`,
+  `--turbo_fused_gemm True`) add Primus-Turbo's fused MXFP8 MLPs for the experts and the shared experts.
 - `PROFILE=True` profiles iterations 6–7 (trace under `output/<team>/<user>/<exp>/tensorboard/`).
 - `PATCH_TRITON_EXPERT_SCHEDULING` (default `1`): see Triton expert scheduling below.
 - `HIPBLASLT_TUNING_OVERRIDE_FILE` (default: the file in `hipblaslt_tuning/`; empty: hipBLASLt's own

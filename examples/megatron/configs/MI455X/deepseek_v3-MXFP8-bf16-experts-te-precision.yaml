@@ -1,0 +1,26 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+#
+# Per-module precision of the DeepSeek-V3 MXFP8 proxy on MI455X: dense linears MXFP8 (MLA q / kv down / up,
+# o_proj, shared experts), routed experts BF16. Loaded as te_precision_config_file (Megatron
+# --te-precision-config-file) under the global Primus-Turbo MXFP8 recipe (--fp8 e4m3 --fp8_recipe mxfp8,
+# see run_deepseek_v3_proxy_mi455x.sh PRIMUS_MXFP8=dense). A matched module with an empty training_recipe
+# runs BF16. The LM head (output_layer) is a Megatron linear and stays BF16 in every recipe.
+#
+# This file is not a Primus experiment recipe.
+###############################################################################
+
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+
+matchers:
+  routed_experts_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.mlp.experts.linear_fc*"
+    enabled: true
