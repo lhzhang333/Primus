@@ -108,18 +108,27 @@ class _Manager:
         return cls.QUANT
 
 
+def _import_ext_or_skip():
+    """The Primus-Turbo extension: its import needs Primus-Turbo, which initializes CUDA on import."""
+    try:
+        import primus.backends.megatron.core.extensions.primus_turbo as ext
+    except Exception as e:  # noqa: BLE001 - RuntimeError on a GPU-less host, ImportError without Turbo
+        pytest.skip(f"the Primus-Turbo extension does not import here: {type(e).__name__}")
+    return ext
+
+
 @pytest.mark.parametrize("fc1_recipe, fc2_recipe, want", [("mx", "mx", True), (None, "mx", False),
                                                           ("mx", None, False), ("mx", "mx2", False)])  # fmt: skip
 def test_route_per_forward(monkeypatch, fc1_recipe, fc2_recipe, want):
-    """Both linears under the same Turbo MXFP8 recipe here (else a BF16 match): memoized per autocast state."""
-    ext = SimpleNamespace(
-        _use_split_wgrad_op=lambda: False, PrimusTurboLowPrecisionGlobalStateManager=_Manager
-    )
-    monkeypatch.setattr(patch, "_ext", lambda: ext)
-    monkeypatch.setattr(patch, "_recipe_key", lambda q: q)
+    """Both linears under the same Turbo MXFP8 recipe here (else a BF16 match): memoized per autocast state, the
+    recipe by value (a new but equal config object per forward hits the memo)."""
+    ext = _import_ext_or_skip()
+    monkeypatch.setattr(ext, "PrimusTurboLowPrecisionGlobalStateManager", _Manager)
+    monkeypatch.setattr(ext, "_use_split_wgrad_op", lambda: False)
+    monkeypatch.setattr(ext, "_quant_recipe_key", lambda q: q)
     asked = []
     recipes = {"fc1": fc1_recipe, "fc2": fc2_recipe}
-    monkeypatch.setattr(patch, "_turbo_mxfp8", lambda lin: asked.append(lin) or recipes[lin])
+    monkeypatch.setattr(ext, "_turbo_mxfp8_quant", lambda lin: asked.append(lin) or recipes[lin])
     mlp = SimpleNamespace(training=True, linear_fc1="fc1", linear_fc2="fc2")
     assert patch._routes_here(mlp) is want and patch._routes_here(mlp) is want
     assert asked == ["fc1", "fc2"], "the decision is memoized per autocast state"

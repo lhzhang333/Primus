@@ -38,7 +38,6 @@ from primus.core.patches import PatchContext, get_args, register_patch
 from primus.core.utils.module_utils import log_rank_0
 
 _PATCH_KEY = "megatron.mlp.turbo_dense_mlp_mxfp8"
-_ROUTE_CACHE = "_turbo_dense_mlp_mxfp8_route"  # per module: autocast state -> whether a forward takes the op
 
 
 def _ext():
@@ -87,44 +86,10 @@ def _should_enable(mlp, args, is_expert: bool) -> bool:
     return isinstance(mlp.linear_fc1, fc1_types) and isinstance(mlp.linear_fc2, fc2_types)
 
 
-def _recipe_key(quant):
-    """Hashable identity of a PrimusTurboQuantConfig (None stays None)."""
-    if quant is None:
-        return None
-    d = quant.data()
-    return (type(d).__name__, d.granularity, d.format, d.block_size, getattr(d, "strategy", None))
-
-
-def _turbo_mxfp8(linear):
-    """The Turbo MXFP8 quant config ``linear`` runs under here (its ``te_quant_params`` over the current autocast),
-    else None."""
-    ext = _ext()
-    manager = ext.PrimusTurboLowPrecisionGlobalStateManager
-    with ext._get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
-        quant = manager.get_turbo_quant_config() if manager.is_turbo_fp8_enabled() else None
-        return quant if quant is not None and quant.mxfp8_scaling() else None
-
-
 def _routes_here(mlp) -> bool:
-    """Whether this forward takes ``mlp_fp8``: both linears under the same Turbo MXFP8 recipe here. Memoized per
-    module and autocast state (the linears' ``te_quant_params`` are fixed once built)."""
-    ext = _ext()
-    if ext._use_split_wgrad_op():
-        return False
-    manager = ext.PrimusTurboLowPrecisionGlobalStateManager
-    key = (
-        mlp.training,
-        manager.is_fp8_enabled(),
-        manager.is_turbo_fp8_enabled(),
-        manager.is_turbo_fp4_enabled(),
-        _recipe_key(manager.get_turbo_quant_config()),
-    )
-    cache = mlp.__dict__.setdefault(_ROUTE_CACHE, {})
-    route = cache.get(key)
-    if route is None:
-        q1, q2 = _turbo_mxfp8(mlp.linear_fc1), _turbo_mxfp8(mlp.linear_fc2)
-        route = cache[key] = q1 is not None and q2 is not None and _recipe_key(q1) == _recipe_key(q2)
-    return route
+    """Whether this forward takes ``mlp_fp8`` (the extension decides: both linears under the same Turbo MXFP8
+    recipe here)."""
+    return _ext()._dense_mlp_routes_to_mlp_fp8(mlp)
 
 
 def _forward_turbo_dense_mlp_mxfp8(mlp, hidden_states):

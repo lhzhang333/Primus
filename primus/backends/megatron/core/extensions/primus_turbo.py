@@ -304,6 +304,28 @@ def _in_mxfp8_linear_context() -> bool:
     )
 
 
+def _quant_recipe_key(quant) -> Optional[tuple]:
+    """The value of a PrimusTurboQuantConfig as a hashable key (None stays None). Primus' ``get_fp8_context``
+    builds a new config object per call, so memos key on this, never on the object."""
+    if quant is None:
+        return None
+    d = quant.data()
+    return (type(d).__name__, d.granularity, d.format, d.block_size, getattr(d, "strategy", None))
+
+
+def _autocast_state_key(module) -> tuple:
+    """What a module's quant decision depends on besides its own (fixed) ``te_quant_params``: train / eval and
+    the surrounding autocast state, the recipe by value."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    return (
+        module.training,
+        manager.is_fp8_enabled(),
+        manager.is_turbo_fp8_enabled(),
+        manager.is_turbo_fp4_enabled(),
+        _quant_recipe_key(manager.get_turbo_quant_config()),
+    )
+
+
 def can_consume_fused_mxfp8_activation(module) -> bool:
     """Whether ``module``, a Primus-Turbo linear about to run, gives its GEMM a prequantized MXFP8 input."""
     if _turbo_rmsnorm_mxfp8() is None or _use_split_wgrad_op():
@@ -330,6 +352,31 @@ def can_consume_fused_mxfp8_activation(module) -> bool:
         with _get_fp8_autocast_for_quant_params(module.te_quant_params, module.training):
             hit = cache[key] = (quant, _in_mxfp8_linear_context())  # (keeps ``quant`` alive: its id is in the key)
     return hit[1]
+
+
+def _turbo_mxfp8_quant(linear):
+    """The Turbo MXFP8 quant config ``linear`` runs under here (its ``te_quant_params`` over the current autocast),
+    else None."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    with _get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
+        quant = manager.get_turbo_quant_config() if manager.is_turbo_fp8_enabled() else None
+        return quant if quant is not None and quant.mxfp8_scaling() else None
+
+
+def _dense_mlp_routes_to_mlp_fp8(mlp) -> bool:
+    """Whether this forward of a Megatron MLP the dense MLP MXFP8 patch enabled takes Primus-Turbo's ``mlp_fp8``:
+    both linears under the same Turbo MXFP8 recipe here. Memoized per module and autocast state (the linears'
+    ``te_quant_params`` are fixed once built)."""
+    if _use_split_wgrad_op():
+        return False
+    key = _autocast_state_key(mlp)
+    cache = mlp.__dict__.setdefault("_turbo_dense_mlp_mxfp8_route", {})
+    route = cache.get(key)
+    if route is None:
+        q1, q2 = _turbo_mxfp8_quant(mlp.linear_fc1), _turbo_mxfp8_quant(mlp.linear_fc2)
+        route = q1 is not None and q2 is not None and _quant_recipe_key(q1) == _quant_recipe_key(q2)
+        cache[key] = route
+    return route
 
 
 def attach_fused_mxfp8_activation(carrier: torch.Tensor, pair, readers: int) -> None:
@@ -459,12 +506,8 @@ def _fused_rmsnorm_mxfp8_mlp(norm, x: torch.Tensor, gamma: torch.Tensor):
     ref = getattr(norm, "_primus_mxfp8_mlp_reader", None)
     if ref is None or "mlp" not in mxfp8_fused_norm_sites():
         return None
-    from primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches import (
-        _routes_here,
-    )
-
     rmsnorm_mxfp8, mlp = _turbo_rmsnorm_mxfp8(), ref()
-    if rmsnorm_mxfp8 is None or mlp is None or _use_split_wgrad_op() or not _routes_here(mlp):
+    if rmsnorm_mxfp8 is None or mlp is None or _use_split_wgrad_op() or not _dense_mlp_routes_to_mlp_fp8(mlp):
         return None
     row_recipe, col_recipe = _mxfp8_activation_recipes(mlp.linear_fc1._parameters["weight"])
     y, pair = rmsnorm_mxfp8(x, gamma, norm.eps, write_y=True, row_recipe=row_recipe, col_recipe=col_recipe)
