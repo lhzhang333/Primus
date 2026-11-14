@@ -105,6 +105,14 @@ dataloader_mp_context: null # "forkserver" | "spawn" | "fork" | null
 # If set to "uniform", the router will force the load balancing to be uniform. (Megatron-LM original behavior)
 moe_router_force_load_balancing_type: "even"
 
+# Embedding wgrad straight into main_grad: each touched row's token sum (the dense
+# gradient's per-row sums, from a stable sort of the ids) is added into the word
+# embedding's main_grad, instead of a dense table-sized gradient being zero-filled
+# every micro-batch and then added in full. Bitwise the unfused result. TP=1,
+# gradient_accumulation_fusion, not in deterministic_mode, not for a weight with
+# zero_out_wgrad (tied output layer / MTP).
+embedding_wgrad_fusion: false
+
 # ===== TE cross entropy =====
 # Pass overwrite_input=True to TE parallel_cross_entropy (cross_entropy_fusion_impl: te)
 # so its backward reuses the logits buffer instead of saving a logits-sized copy
