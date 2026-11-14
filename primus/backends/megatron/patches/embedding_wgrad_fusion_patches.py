@@ -15,7 +15,7 @@ of it into ``main_grad``. With this patch the backward computes the same per-row
 sort: no host sync), so a row's tokens are summed exactly as in the dense gradient -- and a small Triton kernel adds
 each touched row's sum onto ``main_grad`` as Megatron's grad hook does (``main_grad.add_(grad)``). The result is
 bitwise the unfused one, without the table-sized gradient, its fill or its add. It sets ``grad_added_to_main_grad``
-and hands autograd a dummy from the shared dummy-wgrad pool; the forward is unchanged (``F.embedding``).
+and hands autograd a placeholder from the dummy-wgrad pool; the forward is unchanged (``F.embedding``).
 (``index_put_(accumulate=True)`` into ``main_grad`` would add every token row separately in ``main_grad``'s dtype,
 a different rounding from the dense gradient's per-row sums.) Opt-in (default off):
 
@@ -30,6 +30,8 @@ gradients through autograd.
 
 from __future__ import annotations
 
+import importlib
+
 import torch
 import torch.nn.functional as F
 
@@ -40,16 +42,20 @@ from primus.core.utils.module_utils import log_rank_0
 _PATCH_KEY = "megatron.embedding_wgrad_fusion"
 
 
-def _dummy_wgrad(shape, dtype):
-    """A never-read tensor of the weight's shape from the shared dummy-wgrad pool (Primus-Turbo's, which TE's and
-    Primus' helpers draw on too), else TE's."""
+def _dummy_wgrad(shape, dtype, device):
+    """The weight's placeholder gradient, never read or written (Megatron's grad hook sees ``grad_added_to_main_grad``
+    and drops it): Primus-Turbo's public ``get_dummy_wgrad`` when it has one (its shared pool), else TE's
+    ``get_dummy_wgrad`` -- looked up at call time, so the opt-in ``turbo_shared_dummy_wgrad`` patch's rebinding to
+    Primus-Turbo's pool applies."""
     try:
-        from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad
+        turbo_ops = importlib.import_module("primus_turbo.pytorch.ops")
     except ImportError:
-        from transformer_engine.pytorch.module.base import (
-            get_dummy_wgrad as _get_dummy_wgrad,
-        )
-    return _get_dummy_wgrad(list(shape), dtype)
+        turbo_ops = None
+    helper = getattr(turbo_ops, "get_dummy_wgrad", None)
+    if callable(helper):
+        return helper(list(shape), dtype, device)
+    te_base = importlib.import_module("transformer_engine.pytorch.module.base")
+    return te_base.get_dummy_wgrad(list(shape), dtype)
 
 
 _ROW_ADD_KERNEL = None
@@ -119,7 +125,7 @@ class _EmbeddingWgradIntoMainGrad(torch.autograd.Function):
         main_grad = weight.main_grad
         accumulate_rows_(main_grad, ids.reshape(-1), grad_out.reshape(-1, grad_out.shape[-1]).contiguous())
         weight.grad_added_to_main_grad = True
-        return None, _dummy_wgrad(weight.shape, weight.dtype)
+        return None, _dummy_wgrad(weight.shape, weight.dtype, weight.device)
 
 
 def _fusable(emb, ids) -> bool:

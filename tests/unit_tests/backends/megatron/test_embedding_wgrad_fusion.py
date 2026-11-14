@@ -9,6 +9,8 @@ the fused backward against the unfused one (dense ``embedding_dense_backward`` g
 ``main_grad.add_``): bitwise equal (bf16 and fp32 main_grad, mock-like and heavily repeated ids, small tables with
 column tails), forward bitwise, deterministic, the weight's gradient the pooled dummy."""
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -93,10 +95,58 @@ def test_install_routes_and_falls_back(monkeypatch):
     monkeypatch.setattr(patch, "is_patched", lambda *a: False)
     monkeypatch.setattr(patch, "mark_patched", lambda *a: None)
     patch._install_embedding_wgrad_fusion_patch()
-    monkeypatch.setattr(patch, "_dummy_wgrad", lambda shape, dtype: torch.zeros(tuple(shape), dtype=dtype))
+    monkeypatch.setattr(
+        patch,
+        "_dummy_wgrad",
+        lambda shape, dtype, device: torch.zeros(tuple(shape), dtype=dtype, device=device),
+    )
     emb = _emb()
     assert cls.forward(emb, IDS).shape == (2, 4, 16)
     assert cls.forward(_emb(w_zero_out_wgrad=True), IDS) == "orig"
+
+
+class _Recorder:
+    def __init__(self, name):
+        self.name, self.calls = name, []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.name
+
+
+def _stand_in(monkeypatch, name, **attrs):
+    mod = types.ModuleType(name)
+    for k, v in attrs.items():
+        setattr(mod, k, v)
+    monkeypatch.setitem(sys.modules, name, mod)
+    return mod
+
+
+def test_dummy_from_turbos_public_helper(monkeypatch):
+    turbo, te = _Recorder("turbo"), _Recorder("te")
+    _stand_in(monkeypatch, "primus_turbo.pytorch.ops", get_dummy_wgrad=turbo, DUMMY_WGRAD_FLAT_POOL=True)
+    _stand_in(monkeypatch, "transformer_engine.pytorch.module.base", get_dummy_wgrad=te)
+    device = torch.device("cpu")
+    assert patch._dummy_wgrad(torch.Size([64, 16]), torch.bfloat16, device) == "turbo"
+    assert turbo.calls == [(([64, 16], torch.bfloat16, device), {})] and te.calls == []
+
+
+@pytest.mark.parametrize("turbo_ops", ["no public helper", "not importable"])
+def test_dummy_falls_back_to_tes_helper(monkeypatch, turbo_ops):
+    """A Primus-Turbo without the public helper (the CI pin) or none at all: TE's get_dummy_wgrad, looked up at call
+    time (the turbo_shared_dummy_wgrad patch rebinds it)."""
+    if turbo_ops == "no public helper":
+        _stand_in(monkeypatch, "primus_turbo.pytorch.ops")
+    else:
+        monkeypatch.setitem(sys.modules, "primus_turbo.pytorch.ops", None)  # import raises ImportError
+    te_base = _stand_in(
+        monkeypatch, "transformer_engine.pytorch.module.base", get_dummy_wgrad=_Recorder("te")
+    )
+    assert patch._dummy_wgrad(torch.Size([64, 16]), torch.float32, torch.device("cpu")) == "te"
+    rebound = _Recorder("rebound")
+    monkeypatch.setattr(te_base, "get_dummy_wgrad", rebound)
+    assert patch._dummy_wgrad([8, 4], torch.bfloat16, torch.device("cpu")) == "rebound"
+    assert rebound.calls == [(([8, 4], torch.bfloat16), {})]
 
 
 # --------------------------------------------------------------------------------------------------- GPU numerics
@@ -179,24 +229,23 @@ def test_deterministic():
 
 @gpu
 def test_weight_grad_is_the_pooled_dummy():
-    """The weight's .grad is the dummy the dummy-wgrad helper hands out for its shape (not a copy), whatever the
-    installed pool looks like."""
+    """The weight's .grad is the placeholder the dummy-wgrad helper hands out for its shape (not a copy), whatever
+    the installed pool looks like."""
     w = _fused(*_setup("random", torch.bfloat16))[-1]
-    assert w.grad.data_ptr() == patch._dummy_wgrad(w.shape, w.dtype).data_ptr()
+    assert w.grad.data_ptr() == patch._dummy_wgrad(w.shape, w.dtype, w.device).data_ptr()
 
 
 @gpu
 def test_flat_dummy_pool_does_not_grow():
-    """With a Primus-Turbo whose dummy-wgrad pool is one flat buffer per (dtype, device), the embedding's dummy is
-    a view of it: the buffer neither grows nor moves."""
-    turbo_utils = pytest.importorskip("primus_turbo.pytorch.ops.utils")
-    turbo_utils._get_dummy_wgrad([V + 1024, H], torch.bfloat16)  # a dummy larger than the table
-    key = (torch.bfloat16, torch.cuda.current_device())
-    pool = getattr(turbo_utils, "_dummy_wgrads", {}).get(key)
-    if pool is None:
-        pytest.skip("this Primus-Turbo keeps one dummy per shape")
-    numel, ptr = pool.numel(), pool.data_ptr()
+    """With Primus-Turbo's public flat pool (one buffer per dtype and device), the embedding's placeholder is a view
+    of it: after a larger placeholder was handed out, the buffer neither grows nor moves."""
+    ops = pytest.importorskip("primus_turbo.pytorch.ops")
+    if not (callable(getattr(ops, "get_dummy_wgrad", None)) and getattr(ops, "DUMMY_WGRAD_FLAT_POOL", False)):
+        pytest.skip("this Primus-Turbo has no public flat dummy-wgrad pool")
+    device = torch.device("cuda", torch.cuda.current_device())
+    ptr = ops.get_dummy_wgrad([V + 1024, H], torch.bfloat16, device).data_ptr()  # larger than the table
     w = _fused(*_setup("random", torch.bfloat16))[-1]
-    pool = turbo_utils._dummy_wgrads[key]
-    assert pool.numel() == numel and pool.data_ptr() == ptr, "the pool grew"
     assert w.grad.data_ptr() == ptr
+    assert (
+        ops.get_dummy_wgrad([V + 1024, H], torch.bfloat16, device).data_ptr() == ptr
+    ), "the pool grew or moved"
