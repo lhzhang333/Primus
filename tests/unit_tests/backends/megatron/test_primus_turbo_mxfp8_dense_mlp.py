@@ -30,8 +30,14 @@ class _Fc2:
 
 
 def _cfg(**kw):
-    base = dict(gated_linear_unit=True, activation_func=F.silu, add_bias_linear=False, use_te_activation_func=False,
-                glu_linear_offset=0.0, activation_func_clamp_value=None)  # fmt: skip
+    base = dict(
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        use_te_activation_func=False,
+        glu_linear_offset=0.0,
+        activation_func_clamp_value=None,
+    )
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -92,8 +98,9 @@ def test_gfx1250_only(stub_types, monkeypatch):
     """mlp_fp8 runs on gfx1250 alone: elsewhere neither the patch nor a module takes it, whatever the switch."""
     from primus.core.patches import PatchContext
 
-    ctx = PatchContext(backend="megatron", phase="before_train",
-                       extra={"module_config": SimpleNamespace(params=_args())})  # fmt: skip
+    ctx = PatchContext(
+        backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=_args())}
+    )
     assert patch._patch_condition(ctx)
     monkeypatch.setattr(patch, "is_gfx1250", lambda: False)
     assert not patch._patch_condition(ctx)
@@ -134,8 +141,10 @@ def _import_ext_or_skip():
     return ext
 
 
-@pytest.mark.parametrize("fc1_recipe, fc2_recipe, want", [("mx", "mx", True), (None, "mx", False),
-                                                          ("mx", None, False), ("mx", "mx2", False)])  # fmt: skip
+@pytest.mark.parametrize(
+    "fc1_recipe, fc2_recipe, want",
+    [("mx", "mx", True), (None, "mx", False), ("mx", None, False), ("mx", "mx2", False)],
+)
 def test_route_per_forward(monkeypatch, fc1_recipe, fc2_recipe, want):
     """Both linears under the same Turbo MXFP8 recipe here (else a BF16 match): memoized per autocast state, the
     recipe by value (a new but equal config object per forward hits the memo)."""
@@ -162,8 +171,9 @@ gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="gfx1250 MXFP8 mo
 
 
 def _ext_or_skip():
-    import primus.backends.megatron.core.extensions.primus_turbo as ext
     from primus_turbo.pytorch.core.utils import is_gfx1250
+
+    import primus.backends.megatron.core.extensions.primus_turbo as ext
 
     if not is_gfx1250() or patch._mlp_fp8_op() is None:
         pytest.skip("needs gfx1250 and Primus-Turbo's mlp_fp8")
@@ -176,8 +186,12 @@ def mx_state(monkeypatch):
     manager = ext.PrimusTurboLowPrecisionGlobalStateManager
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP4_ENABLED", False)
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP8_ENABLED", True)
-    quant = ext.PrimusTurboQuantConfig(format=ext.Format.E4M3, granularity=ext.ScalingGranularity.MX_BLOCKWISE,
-                                       block_size=32, scale_dtype=ext.ScaleDtype.E8M0)  # fmt: skip
+    quant = ext.PrimusTurboQuantConfig(
+        format=ext.Format.E4M3,
+        granularity=ext.ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ext.ScaleDtype.E8M0,
+    )
     monkeypatch.setattr(manager, "PRIMUS_TURBO_QUANT_CONFIG", quant)
     monkeypatch.setattr(ext, "_use_split_wgrad_op", lambda: False)
     return ext
@@ -200,10 +214,20 @@ def _linear(n, k, seed, main_grad_dtype):
     w.main_grad = (0.01 * _randn(n, k, seed=seed + 100).float()).to(main_grad_dtype)
     w.grad_added_to_main_grad = False
     config = SimpleNamespace(gradient_accumulation_fusion=True, normalization="RMSNorm")
-    return _Stub(_parameters={"weight": w}, use_bias=False, offload=False, config=config,
-                 disable_parameter_transpose_cache=False, quantized_weight_buffer=None, quantized_weight_t_buffer=None,
-                 te_quant_params=None, training=True, is_first_microbatch=True, _forward_pre_hooks={},
-                 _forward_pre_hooks_with_kwargs={})  # fmt: skip
+    return _Stub(
+        _parameters={"weight": w},
+        use_bias=False,
+        offload=False,
+        config=config,
+        disable_parameter_transpose_cache=False,
+        quantized_weight_buffer=None,
+        quantized_weight_t_buffer=None,
+        te_quant_params=None,
+        training=True,
+        is_first_microbatch=True,
+        _forward_pre_hooks={},
+        _forward_pre_hooks_with_kwargs={},
+    )
 
 
 class _KernelSwiGLU(torch.autograd.Function):
@@ -328,7 +352,9 @@ def test_fused_pre_mlp_norm_bitwise(mx_state, monkeypatch, micro_batches):
             x = _randn(s, b, h, seed=10 + mb).requires_grad_()
             y = mx_state.PrimusTurboRMSNorm.forward(norm, x)
             assert hasattr(y, attr) == fused
-            router = (y.float() * _randn(s, b, h, seed=30 + mb).float()).sum()  # the router / dispatcher read y
+            router = (
+                y.float() * _randn(s, b, h, seed=30 + mb).float()
+            ).sum()  # the router / dispatcher read y
             out, _ = patch._forward_turbo_dense_mlp_mxfp8(mlp, y)
             assert not hasattr(y, attr), "the shared experts did not take the pair"
             (router + (out.float() * _randn(s, b, h, seed=20 + mb).float()).sum()).backward()

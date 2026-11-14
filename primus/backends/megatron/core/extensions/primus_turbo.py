@@ -637,7 +637,7 @@ def _mxfp8_wgrad_can_accumulate(weight: torch.Tensor) -> bool:
 def _mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
     """Primus-Turbo's ``mx_wgrad_accum_supported``, on gfx1250 only, asked once per (grouped, dtype) and process:
     the linears publish the GEMM backends at construction, before their first forward asks. Elsewhere (gfx950's
-    MXFP8 GEMMs have the epilogue too) the separate add stays, so this patch set changes no other arch's rounding."""
+    MXFP8 GEMMs have the epilogue too) the separate add stays, so no other arch's rounding changes."""
     if not _is_gfx1250():
         return False
     try:

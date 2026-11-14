@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 from primus.backends.megatron.patches import optimizer_patches
@@ -31,8 +30,14 @@ def restore_post_init():
 
 
 def _config(**kw):
-    base = dict(optimizer="adam", use_distributed_optimizer=True, use_precision_aware_optimizer=True,
-                main_params_dtype=torch.float32, exp_avg_dtype=torch.bfloat16, exp_avg_sq_dtype=torch.bfloat16)  # fmt: skip
+    base = dict(
+        optimizer="adam",
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        main_params_dtype=torch.float32,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
     base.update(kw)
     return OptimizerConfig(**base)
 
@@ -49,8 +54,15 @@ def test_upstream_switches_master_weights_for_mxfp8(restore_post_init):
         (dict(fp8_recipe="mxfp8"), True),  # the fix: same optimizer path as without FP8
         (dict(fp8_recipe="delayed"), True),
         (dict(fp8_recipe="blockwise"), False),  # other recipes untouched
-        (dict(fp8_recipe="mxfp8", use_precision_aware_optimizer=False, exp_avg_dtype=torch.float32,
-              exp_avg_sq_dtype=torch.float32), False),  # fmt: skip
+        (
+            dict(
+                fp8_recipe="mxfp8",
+                use_precision_aware_optimizer=False,
+                exp_avg_dtype=torch.float32,
+                exp_avg_sq_dtype=torch.float32,
+            ),
+            False,
+        ),
     ],
 )
 def test_patch_keeps_te_master_weights(restore_post_init, kw, want):
@@ -58,8 +70,15 @@ def test_patch_keeps_te_master_weights(restore_post_init, kw, want):
     assert _config(**kw).use_precision_aware_optimizer_no_fp8_or_ds_fp8 is want
 
 
-_TURBO_MXFP8 = dict(use_precision_aware_optimizer=True, fp8="e4m3", fp8_recipe="mxfp8", fp8_param_gather=False,
-                    enable_primus_turbo=True, use_turbo_gemm=True, use_turbo_grouped_gemm=True)  # fmt: skip
+_TURBO_MXFP8 = dict(
+    use_precision_aware_optimizer=True,
+    fp8="e4m3",
+    fp8_recipe="mxfp8",
+    fp8_param_gather=False,
+    enable_primus_turbo=True,
+    use_turbo_gemm=True,
+    use_turbo_grouped_gemm=True,
+)
 
 
 @pytest.mark.parametrize(
@@ -70,8 +89,16 @@ _TURBO_MXFP8 = dict(use_precision_aware_optimizer=True, fp8="e4m3", fp8_recipe="
         (dict(enable_primus_turbo=False), True, False),
         (dict(use_turbo_gemm=False, use_turbo_grouped_gemm=False), True, False),  # nothing Turbo quantizes
         (dict(use_turbo_gemm=False), True, True),  # the experts through Turbo
-        (dict(use_turbo_gemm=False, use_turbo_grouped_gemm=False, use_turbo_mega_moe=True,
-              turbo_mega_moe_precision="mxfp8"), True, True),  # fmt: skip
+        (
+            dict(
+                use_turbo_gemm=False,
+                use_turbo_grouped_gemm=False,
+                use_turbo_mega_moe=True,
+                turbo_mega_moe_precision="mxfp8",
+            ),
+            True,
+            True,
+        ),
         (dict(fp8_param_gather=True), True, False),  # FP8 primary weights need MCore's FP32 masters
         (dict(fp8=None), True, False),
         (dict(fp8_recipe="tensorwise"), True, False),
@@ -87,6 +114,7 @@ def test_patch_condition(monkeypatch, args, gfx1250, want):
     patch = PatchRegistry.get("megatron.optimizer.precision_aware_turbo_mxfp8")
     monkeypatch.setattr(gpu_arch, "is_gfx1250", lambda: gfx1250)
     params = SimpleNamespace(**{**_TURBO_MXFP8, **args})
-    ctx = PatchContext(backend="megatron", phase="before_train",
-                       extra={"module_config": SimpleNamespace(params=params)})  # fmt: skip
+    ctx = PatchContext(
+        backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=params)}
+    )
     assert bool(patch.condition(ctx)) is want

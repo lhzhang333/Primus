@@ -38,9 +38,19 @@ def _mx():
 
 def _eligible(self, hidden_states, kw):
     cfg = self.config
-    if any(kw.get(n) is not None for n in ("key_value_states", "inference_context", "inference_params",
-                                           "packed_seq_params", "rotary_pos_emb", "rotary_pos_cos",
-                                           "rotary_pos_sin", "attention_bias")):  # fmt: skip
+    if any(
+        kw.get(n) is not None
+        for n in (
+            "key_value_states",
+            "inference_context",
+            "inference_params",
+            "packed_seq_params",
+            "rotary_pos_emb",
+            "rotary_pos_cos",
+            "rotary_pos_sin",
+            "attention_bias",
+        )
+    ):
         return False
     if kw.get("rotary_pos_cos_sin"):
         return False
@@ -50,10 +60,15 @@ def _eligible(self, hidden_states, kw):
         return False
     if getattr(self, "checkpoint_core_attention", False):
         return False
-    if any(getattr(self, n, False) for n in ("offload_qkv_linear", "offload_core_attention", "offload_attn_proj")):
+    if any(
+        getattr(self, n, False) for n in ("offload_qkv_linear", "offload_core_attention", "offload_attn_proj")
+    ):
         return False
-    if (getattr(cfg, "context_parallel_size", 1) != 1 or getattr(cfg, "tensor_model_parallel_size", 1) != 1
-            or getattr(cfg, "sequence_parallel", False)):  # fmt: skip
+    if (
+        getattr(cfg, "context_parallel_size", 1) != 1
+        or getattr(cfg, "tensor_model_parallel_size", 1) != 1
+        or getattr(cfg, "sequence_parallel", False)
+    ):
         return False
     if self.attn_mask_type != AttnMaskType.causal:
         return False
@@ -67,7 +82,9 @@ def _eligible(self, hidden_states, kw):
 def _forward_fused(self, hidden_states):
     cfg = self.config
     rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(None, None, hidden_states, cfg, None)
-    cos, sin = self.rotary_pos_emb.get_cached_cos_sin(rotary_seq_len, dtype=hidden_states.dtype, packed_seq=False)
+    cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
+        rotary_seq_len, dtype=hidden_states.dtype, packed_seq=False
+    )
     q_compressed, kv_combined = self._qkv_down_projection(hidden_states)
     kv_compressed, k_pos_emb = torch.split(kv_combined, [cfg.kv_lora_rank, cfg.qk_pos_emb_head_dim], dim=-1)
     if cfg.q_lora_rank is not None:
@@ -82,7 +99,11 @@ def _forward_fused(self, hidden_states):
     k_pos_emb = torch.unsqueeze(k_pos_emb, -2)  # [s, b, 1, 64]
     mx = _mx()
     reason = mx.rope_unsupported_reason(
-        q.transpose(0, 1), kv.transpose(0, 1), k_pos_emb.transpose(0, 1), cos.reshape(-1, 64), sin.reshape(-1, 64),
+        q.transpose(0, 1),
+        kv.transpose(0, 1),
+        k_pos_emb.transpose(0, 1),
+        cos.reshape(-1, 64),
+        sin.reshape(-1, 64),
         True,
     )
     if reason is not None:
@@ -95,20 +116,34 @@ def _forward_fused(self, hidden_states):
 
 def _forward(self, hidden_states, attention_mask, *args, **kwargs):
     named = dict(kwargs)
-    names = ("key_value_states", "inference_context", "rotary_pos_emb", "rotary_pos_cos", "rotary_pos_sin",
-             "rotary_pos_cos_sin", "attention_bias", "packed_seq_params", "position_ids", "sequence_len_offset")
+    names = (
+        "key_value_states",
+        "inference_context",
+        "rotary_pos_emb",
+        "rotary_pos_cos",
+        "rotary_pos_sin",
+        "rotary_pos_cos_sin",
+        "attention_bias",
+        "packed_seq_params",
+        "position_ids",
+        "sequence_len_offset",
+    )
     for n, a in zip(names, args):
         named[n] = a
     if _eligible(self, hidden_states, named):
         _STATS["fused"] += 1
         if _STATS["fused"] == 1:
-            print(f"[mla_rope_fused_mx] fused-RoPE MXFP8 path active (layer {getattr(self, 'layer_number', '?')})",
-                  flush=True)
+            print(
+                f"[mla_rope_fused_mx] fused-RoPE MXFP8 path active (layer {getattr(self, 'layer_number', '?')})",
+                flush=True,
+            )
         return _forward_fused(self, hidden_states)
     _STATS["fallback"] += 1
     if _STATS["fallback"] == 1:
-        print(f"[mla_rope_fused_mx] fallback to Megatron's MLA forward (layer {getattr(self, 'layer_number', '?')})",
-              flush=True)
+        print(
+            f"[mla_rope_fused_mx] fallback to Megatron's MLA forward (layer {getattr(self, 'layer_number', '?')})",
+            flush=True,
+        )
     return _ORIG_FORWARD(self, hidden_states, attention_mask, *args, **kwargs)
 
 

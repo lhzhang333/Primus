@@ -21,8 +21,11 @@ _EXTENSION = "primus.backends.megatron.core.extensions.primus_turbo"
 
 
 def _ctx(**params):
-    return PatchContext(backend="megatron", phase="before_train",
-                        extra={"module_config": SimpleNamespace(params=SimpleNamespace(**params))})  # fmt: skip
+    return PatchContext(
+        backend="megatron",
+        phase="before_train",
+        extra={"module_config": SimpleNamespace(params=SimpleNamespace(**params))},
+    )
 
 
 @pytest.mark.parametrize(
@@ -59,8 +62,12 @@ def _helper(shape, dtype, device, zero=False):
 
 @pytest.mark.parametrize(
     "attrs, has_pool",
-    [({}, False), (dict(get_dummy_wgrad=_helper), False), (dict(DUMMY_WGRAD_FLAT_POOL=True), False),
-     (dict(get_dummy_wgrad=_helper, DUMMY_WGRAD_FLAT_POOL=True), True)],  # fmt: skip
+    [
+        ({}, False),
+        (dict(get_dummy_wgrad=_helper), False),
+        (dict(DUMMY_WGRAD_FLAT_POOL=True), False),
+        (dict(get_dummy_wgrad=_helper, DUMMY_WGRAD_FLAT_POOL=True), True),
+    ],
 )
 def test_needs_turbos_public_flat_pool(monkeypatch, attrs, has_pool):
     _turbo_ops(monkeypatch, **attrs)

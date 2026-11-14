@@ -87,7 +87,9 @@ def test_mxfp8_consumer_is_accepted(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("attrs", [{}, {"CONSUMES_PERMUTE_SEAM_MXFP8": False}, None], ids=["no_flag", "false", "no_turbo"])
+@pytest.mark.parametrize(
+    "attrs", [{}, {"CONSUMES_PERMUTE_SEAM_MXFP8": False}, None], ids=["no_flag", "false", "no_turbo"]
+)
 def test_mxfp8_needs_a_turbo_that_takes_the_handoff(monkeypatch, attrs):
     """A Primus-Turbo whose grouped_mlp_fp8 does not take the permute's handoff (CI's pin, upstream main) would
     quantize the unwritten placeholder: the fusion is refused with MXFP8, and MXFP4 is not asked."""

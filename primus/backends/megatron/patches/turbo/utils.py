@@ -42,7 +42,9 @@ def turbo_quantizes_mxfp8(args) -> bool:
         getattr(args, "turbo_mega_moe_precision", "bf16") == "mxfp8"
     )
     return bool(
-        getattr(args, "use_turbo_gemm", False) or getattr(args, "use_turbo_grouped_gemm", False) or mega_moe_mxfp8
+        getattr(args, "use_turbo_gemm", False)
+        or getattr(args, "use_turbo_grouped_gemm", False)
+        or mega_moe_mxfp8
     )
 
 

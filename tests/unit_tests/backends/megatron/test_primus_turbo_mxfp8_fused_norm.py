@@ -86,8 +86,12 @@ def test_consumer_memo_keys_on_the_recipe_value(monkeypatch):
 
         @staticmethod
         def get_turbo_quant_config():  # a new object every call, as get_fp8_context makes it
-            return PrimusTurboQuantConfig(format=Format.E4M3, granularity=ScalingGranularity.MX_BLOCKWISE,
-                                          block_size=32, scale_dtype=ScaleDtype.E8M0)  # fmt: skip
+            return PrimusTurboQuantConfig(
+                format=Format.E4M3,
+                granularity=ScalingGranularity.MX_BLOCKWISE,
+                block_size=32,
+                scale_dtype=ScaleDtype.E8M0,
+            )
 
     asked = []
     monkeypatch.setattr(ext, "PrimusTurboLinear", Linear)
@@ -261,8 +265,12 @@ def test_link_only_mla_down_projections():
         core_attention=None,
         offload_qkv_linear=False,
     )
-    layer = SimpleNamespace(input_layernorm=PrimusTurboRMSNorm(64).cuda(), self_attention=attn,
-                            recompute_input_layernorm=False, offload_attn_norm=False)  # fmt: skip
+    layer = SimpleNamespace(
+        input_layernorm=PrimusTurboRMSNorm(64).cuda(),
+        self_attention=attn,
+        recompute_input_layernorm=False,
+        offload_attn_norm=False,
+    )
     assert link_mxfp8_norm_readers(layer)
     assert [r() for r in layer.input_layernorm._primus_mxfp8_readers] == [q, kv]
     dsa = SimpleNamespace(requires_dsa_inputs=True)
@@ -274,7 +282,7 @@ def test_link_only_mla_down_projections():
         dict(self_attention=SimpleNamespace(**{**vars(attn), "offload_qkv_linear": True})),
         dict(self_attention=SimpleNamespace(**{**vars(attn), "core_attention": dsa})),
         dict(input_layernorm=torch.nn.LayerNorm(64)),
-    ):  # fmt: skip
+    ):
         other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(), **change})
         assert not link_mxfp8_norm_readers(other), change
         assert not hasattr(other.input_layernorm, "_primus_mxfp8_readers")
@@ -283,6 +291,7 @@ def test_link_only_mla_down_projections():
         delattr(other, missing)
         assert not link_mxfp8_norm_readers(other), missing
     no_offload_attr = SimpleNamespace(**{k: v for k, v in vars(attn).items() if k != "offload_qkv_linear"})
-    other = SimpleNamespace(**{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(),
-                               "self_attention": no_offload_attr})  # fmt: skip
+    other = SimpleNamespace(
+        **{**vars(layer), "input_layernorm": PrimusTurboRMSNorm(64).cuda(), "self_attention": no_offload_attr}
+    )
     assert not link_mxfp8_norm_readers(other)

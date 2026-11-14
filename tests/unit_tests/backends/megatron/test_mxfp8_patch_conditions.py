@@ -40,7 +40,9 @@ _SWITCH_ENVS = (
 
 
 def _ctx(params) -> PatchContext:
-    return PatchContext(backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=params)})
+    return PatchContext(
+        backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=params)}
+    )
 
 
 _CONFIGS = Path(__file__).resolve().parents[4] / "primus/configs"
@@ -50,8 +52,12 @@ def _default_params(**overrides) -> SimpleNamespace:
     """The shipped defaults: the Megatron module configs and the language-model defaults (e.g.
     gradient_accumulation_fusion: true), as a job without any of these switches gets them."""
     params = {}
-    for name in ("models/megatron/language_model.yaml", "modules/megatron/trainer_base.yaml",
-                 "modules/megatron/primus_megatron_module.yaml", "modules/megatron/primus_turbo.yaml"):  # fmt: skip
+    for name in (
+        "models/megatron/language_model.yaml",
+        "modules/megatron/trainer_base.yaml",
+        "modules/megatron/primus_megatron_module.yaml",
+        "modules/megatron/primus_turbo.yaml",
+    ):
         params.update(parse_yaml(str(_CONFIGS / name)))
     params.update(overrides)
     return SimpleNamespace(**params)
@@ -80,8 +86,17 @@ def test_inert_by_default(no_turbo, patch_id, enable_primus_turbo):
 
 @pytest.mark.parametrize(
     "value, sites",
-    [("0", set()), ("", set()), ("off", set()), ("1", {"up", "input", "mlp"}), ("all", {"up", "input", "mlp"}),
-     ("up", {"up"}), ("input", {"input"}), ("mlp", {"mlp"}), ("up, input", {"up", "input"})],  # fmt: skip
+    [
+        ("0", set()),
+        ("", set()),
+        ("off", set()),
+        ("1", {"up", "input", "mlp"}),
+        ("all", {"up", "input", "mlp"}),
+        ("up", {"up"}),
+        ("input", {"input"}),
+        ("mlp", {"mlp"}),
+        ("up, input", {"up", "input"}),
+    ],
 )
 def test_fused_norm_sites(monkeypatch, value, sites):
     from primus.backends.megatron.core.extensions.mxfp8_fused_norm_sites import (

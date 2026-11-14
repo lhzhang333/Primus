@@ -112,7 +112,9 @@ def _forward_turbo_dense_mlp_mxfp8(mlp, hidden_states):
     # DistOpt param-gather overlap in registration order: wait fc1, dispatch fc2, wait fc2, dispatch the next layer
     _run_module_forward_pre_hooks(fc1, (hidden_states,))
     _run_module_forward_pre_hooks(fc2, (hidden_states,))
-    carrier = hidden_states  # a pre-MLP RMSNorm's output may carry its MXFP8 pair (PRIMUS_MXFP8_FUSED_NORM=mlp)
+    carrier = (
+        hidden_states  # a pre-MLP RMSNorm's output may carry its MXFP8 pair (PRIMUS_MXFP8_FUSED_NORM=mlp)
+    )
     hidden_states = _apply_fc1_fused_norm(fc1, hidden_states, mlp.config)
     leading = hidden_states.shape[:-1]
     x = hidden_states.reshape(-1, hidden_states.shape[-1])
