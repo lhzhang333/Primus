@@ -484,6 +484,21 @@ def _fuse_wgrad_accum_pattern(config, weight: torch.Tensor) -> Optional[str]:
     return "megatron"
 
 
+def _not_leaves(*copies):
+    """The cached quantized copies of a weight, as tensors that do not require grad (anything else, such as a
+    missing transpose copy, passes through unchanged).
+
+    Primus-Turbo's ``create_quantized_weight`` gives them the weight's ``requires_grad``, which makes each an
+    autograd leaf: passing it through :func:`_bridge_weight_grad` then puts an AccumulateGrad node holding it
+    into the graph (the bridge's outputs need no such leaf: they require grad through ``weight``). Megatron's
+    token dispatcher keeps the last microbatch's ``probs`` (and so that graph) until the layer's next forward,
+    so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
+    step's first microbatch. ``detach`` (same storage) rather than ``requires_grad_(False)``, which raises on a
+    copy that is a view with a grad_fn (a TENSORWISE transpose copy is one).
+    """
+    return tuple(c.detach() if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies)
+
+
 def _maybe_create_quantized_weight_buffers(
     weight: torch.Tensor,
     dest_dtype: torch.dtype,
@@ -502,11 +517,13 @@ def _maybe_create_quantized_weight_buffers(
     need_weight_transpose_cache = not disable_parameter_transpose_cache
 
     if create_quantized_weight is not None:
-        return create_quantized_weight(
-            weight,
-            dest_dtype,
-            quant_config_internal,
-            need_weight_transpose_cache=need_weight_transpose_cache,
+        return _not_leaves(
+            *create_quantized_weight(
+                weight,
+                dest_dtype,
+                quant_config_internal,
+                need_weight_transpose_cache=need_weight_transpose_cache,
+            )
         )
 
     # TODO(ruibin): Remove this fallback path once create_quantized_weight is
@@ -564,7 +581,7 @@ def _maybe_create_quantized_weight_buffers(
         else:
             raise ValueError(f"Unsupported granularity: {granularity}")
 
-    return quantized_weight_rowwise, quantized_weight_colwise
+    return _not_leaves(quantized_weight_rowwise, quantized_weight_colwise)
 
 
 def _call_fp8_autocast_enter(
