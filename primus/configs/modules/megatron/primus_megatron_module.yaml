@@ -132,6 +132,12 @@ te_ce_overwrite_input: true
 # only (other cases keep TE). Same logits caveat as te_ce_overwrite_input;
 # cannot be combined with use_turbo_cross_entropy.
 deferred_cross_entropy: false
+# Call TE parallel_cross_entropy with is_cg_capturable=True: its backward then skips
+# a blocking host-to-device copy (a host sync per micro-batch) that only serves a
+# shortcut for a scalar loss gradient, which Megatron's per-token loss never has.
+# Same result bit for bit. With deferred_cross_entropy, only the calls the deferred
+# path hands back to TE get the flag.
+te_cross_entropy_cg_capturable: false
 
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
