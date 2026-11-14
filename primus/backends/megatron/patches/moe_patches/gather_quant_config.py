@@ -3,6 +3,7 @@
 
 """Argument validation and scoped handoff for the Turbo MXFP4 / MXFP8 MoE consumer."""
 
+import importlib
 from contextvars import ContextVar
 from functools import wraps
 
@@ -36,6 +37,12 @@ def validate_gather_quant_config(args):
             "moe_permute_quant_fusion requires fp4='e2m1' with fp4_recipe='mxfp4', "
             "or fp8='e4m3' with fp8_recipe='mxfp8'"
         )
+    if mxfp8 and not turbo_consumes_permute_seam_mxfp8():
+        raise ValueError(
+            "moe_permute_quant_fusion with fp8_recipe='mxfp8' requires a Primus-Turbo whose fused grouped MXFP8 MLP "
+            "takes the permute's handoff (primus_turbo.pytorch.ops.grouped_mlp_fp8.CONSUMES_PERMUTE_SEAM_MXFP8); "
+            "the installed one would quantize the permute's unwritten placeholder"
+        )
     if not getattr(args, "moe_skip_identity_sort", True):
         raise ValueError("moe_permute_quant_fusion requires moe_skip_identity_sort=true")
     if getattr(args, "expert_tensor_parallel_size", None) not in (None, 1):
@@ -50,6 +57,18 @@ def validate_gather_quant_config(args):
         if getattr(args, name, False):
             raise ValueError(f"moe_permute_quant_fusion requires {name}=false")
     return forward, backward
+
+
+def turbo_consumes_permute_seam_mxfp8() -> bool:
+    """Whether the installed Primus-Turbo's ``grouped_mlp_fp8`` gathers the permuted rows in its MXFP8 quantizer
+    (it exports ``CONSUMES_PERMUTE_SEAM_MXFP8``). A build without the flag quantizes the permute's placeholder as
+    if it were the activation, so the fusion must not be accepted. Imports Primus-Turbo; called only once the
+    fusion is requested with MXFP8."""
+    try:
+        module = importlib.import_module("primus_turbo.pytorch.ops.grouped_mlp_fp8")
+    except Exception:  # noqa: BLE001 - no Primus-Turbo, or one that does not import on this host
+        return False
+    return bool(getattr(module, "CONSUMES_PERMUTE_SEAM_MXFP8", False))
 
 
 def _uses_mx():

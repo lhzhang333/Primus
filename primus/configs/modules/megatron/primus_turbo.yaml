@@ -119,7 +119,8 @@ use_turbo_rms_norm: false
 use_turbo_norm_te_linear: false
 
 # ===== MoE gather quantization =====
-# EP1/TP1 all-to-all with the fused Turbo MXFP4 grouped MLP only.
+# EP1/TP1 all-to-all with the fused Turbo MXFP4 grouped MLP, or the fused MXFP8 one when the
+# installed Primus-Turbo takes the permute's handoff (grouped_mlp_fp8.CONSUMES_PERMUTE_SEAM_MXFP8).
 moe_permute_quant_fusion: false
 moe_backward_permute_quant_fusion: false
 # Preserve activation storage across identity expert sorting.
