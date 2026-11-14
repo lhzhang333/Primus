@@ -300,7 +300,7 @@ def _in_mxfp8_linear_context() -> bool:
     return (
         config.granularity == ScalingGranularity.MX_BLOCKWISE
         and config.block_size == 32
-        and config.format in (Format.E4M3, Format.HYBRID)
+        and config.format == Format.E4M3
     )
 
 
@@ -718,12 +718,12 @@ def _bridge_weight_grad(
                 # the dummy wgrad returned below means they are not recoverable from
                 # param.grad either. The fused path above is immune because its beta=1
                 # epilogue accumulates on every microbatch regardless of the flag.
-                if grad_quantized_weight is None:  # set_materialize_grads(False): no gradient reached it
-                    pass
-                elif _is_gfx1250():
-                    inplace_add_triton_(weight.main_grad, grad_quantized_weight)
-                else:
-                    weight.main_grad.add_(grad_quantized_weight)
+                # set_materialize_grads(False): None when no gradient reached the copy
+                if grad_quantized_weight is not None:
+                    if _is_gfx1250():
+                        inplace_add_triton_(weight.main_grad, grad_quantized_weight)
+                    else:
+                        weight.main_grad.add_(grad_quantized_weight)
                 weight.grad_added_to_main_grad = True
 
             return grad_x, _get_dummy_wgrad(list(weight.shape), weight.dtype), None, None
@@ -870,11 +870,10 @@ def _not_leaves(*copies):
     into the graph (the bridge's outputs need no such leaf: they require grad through ``weight``). Megatron's
     token dispatcher keeps the last microbatch's ``probs`` (and so that graph) until the layer's next forward,
     so those nodes kept the previous step's caches of every layer before the last MoE router alive into the next
-    step's first microbatch: 3 x 2.7 GiB on top of the new caches at the DeepSeek-V3 proxy's allocation peak.
+    step's first microbatch. ``detach`` (same storage) rather than ``requires_grad_(False)``, which raises on a
+    copy that is a view with a grad_fn (a TENSORWISE transpose copy is one).
     """
-    return tuple(
-        c.requires_grad_(False) if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies
-    )
+    return tuple(c.detach() if isinstance(c, torch.Tensor) and c.requires_grad else c for c in copies)
 
 
 def _maybe_create_quantized_weight_buffers(

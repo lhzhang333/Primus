@@ -110,21 +110,25 @@ def test_cached_weight_layout_follows_turbos_query(
 
 
 @pytest.mark.parametrize("with_transpose", [True, False])
-def test_cached_copies_are_not_autograd_leaves(monkeypatch, with_transpose):
+@pytest.mark.parametrize("transpose_is_a_view", [False, True])
+def test_cached_copies_are_not_autograd_leaves(monkeypatch, with_transpose, transpose_is_a_view):
     """Primus-Turbo hands back copies with the weight's requires_grad; as autograd leaves they would sit in
     AccumulateGrad nodes of every micro-batch's graph (kept alive across steps by the token dispatcher's probs).
-    The cache returns the same tensors with requires_grad cleared; a missing transpose copy stays None."""
+    The cache returns them detached (same storage, no requires_grad); a missing transpose copy stays None. A copy
+    that is a view with a grad_fn (a TENSORWISE transpose copy) is detached too, not refused."""
     monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: False)
     weight = torch.zeros(2, 64, 64, dtype=torch.bfloat16, requires_grad=True)
     made = []
 
     def create(weight, dest_dtype, quant_config, need_weight_transpose_cache=False, scaling_recipe=None):
         rowwise = torch.zeros(weight.shape, dtype=torch.bfloat16, requires_grad=weight.requires_grad)
-        colwise = (
-            torch.zeros(weight.shape, dtype=torch.bfloat16, requires_grad=weight.requires_grad)
-            if need_weight_transpose_cache
-            else None
-        )
+        colwise = None
+        if need_weight_transpose_cache:
+            colwise = (
+                rowwise.transpose(-2, -1)
+                if transpose_is_a_view
+                else torch.zeros(weight.shape, dtype=torch.bfloat16, requires_grad=weight.requires_grad)
+            )
         made.extend((rowwise, colwise))
         return rowwise, colwise
 
@@ -132,9 +136,10 @@ def test_cached_copies_are_not_autograd_leaves(monkeypatch, with_transpose):
     rowwise, colwise = _maybe_create_quantized_weight_buffers(
         weight, float8_e4m3, MXFP8, disable_parameter_transpose_cache=not with_transpose
     )
-    assert rowwise is made[0] and not rowwise.requires_grad
+    assert rowwise.data_ptr() == made[0].data_ptr() and not rowwise.requires_grad and rowwise.grad_fn is None
     if with_transpose:
-        assert colwise is made[1] and not colwise.requires_grad
+        assert colwise.data_ptr() == made[1].data_ptr() and colwise.shape == made[1].shape
+        assert not colwise.requires_grad and colwise.grad_fn is None
     else:
         assert colwise is None
 
