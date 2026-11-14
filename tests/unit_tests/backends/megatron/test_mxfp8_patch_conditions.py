@@ -24,6 +24,7 @@ _PATCHES = {
     "megatron.turbo.mxfp8_fused_norm": "primus.backends.megatron.patches.turbo.mxfp8_fused_norm_patches",
     "megatron.mlp.turbo_dense_mlp_mxfp8": "primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches",
     "megatron.te.shared_dummy_wgrad": "primus.backends.megatron.patches.te_patches.shared_dummy_wgrad_patches",
+    "megatron.optimizer.precision_aware_turbo_mxfp8": "primus.backends.megatron.patches.optimizer_patches",
 }
 
 _EXTENSION = "primus.backends.megatron.core.extensions.primus_turbo"
