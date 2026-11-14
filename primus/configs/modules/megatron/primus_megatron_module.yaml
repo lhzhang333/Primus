@@ -136,6 +136,12 @@ embedding_wgrad_fusion: false
 # tokens_per_expert kept on the device by use_turbo_grouped_gemm). Any host copy
 # keeps the wait. No numerical change.
 moe_skip_idle_dtoh_sync: false
+# Record the NaN/Inf checks of the loss and of the DDP bucket grad norms
+# (check_for_nan_in_loss_and_grad, rerun_mode: disabled) during forward_backward_func
+# and evaluate them with one host sync when it returns, before the optimizer step.
+# A failure raises the same error, after the step's remaining micro-batches; no
+# update is applied. No numerical change.
+defer_nonfinite_checks: false
 
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
