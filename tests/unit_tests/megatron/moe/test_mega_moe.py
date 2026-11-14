@@ -82,10 +82,17 @@ def _activation_fields(activation_func, glu_linear_offset=0.0, activation_func_c
 
 
 @pytest.mark.parametrize("silu", [torch.nn.functional.silu, torch.nn.SiLU])
-@pytest.mark.parametrize("clamp", [None, 10.0])
-def test_mega_moe_activation_silu_keeps_kernel_default(silu, clamp):
+def test_mega_moe_activation_plain_silu_is_unclamped(silu):
+    # DeepSeek-V3's SwiGLU has no clamp in Megatron, so the kernels' default +-10 must not apply either.
+    assert mega_moe_activation(_activation_fields(silu)) == GLUActivation(
+        gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None
+    )
+
+
+@pytest.mark.parametrize("silu", [torch.nn.functional.silu, torch.nn.SiLU])
+def test_mega_moe_activation_clamped_silu_keeps_kernel_default(silu):
     # DeepSeek-V4 sets activation_func_clamp_value on a SiLU config; forwarding it would change its numerics.
-    assert mega_moe_activation(_activation_fields(silu, activation_func_clamp_value=clamp)) is None
+    assert mega_moe_activation(_activation_fields(silu, activation_func_clamp_value=10.0)) is None
 
 
 def test_mega_moe_activation_quick_geglu_bounds():
