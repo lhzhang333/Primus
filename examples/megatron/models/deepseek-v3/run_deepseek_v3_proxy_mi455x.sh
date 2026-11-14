@@ -72,7 +72,7 @@ fi
 # (TransformerEngine's autocast stays off on gfx1250): empty or off; experts: the routed experts (the dense
 # linears stay BF16 on TransformerEngine); dense: the MLA and shared-expert linears (on Primus-Turbo, routed
 # experts BF16); dense_experts: both. The LM head stays BF16. The per-module BF16 overrides are the
-# te_precision_config_file matchers of configs/MI455X/deepseek_v3-MXFP8-bf16-*.yaml.
+# te_precision_config_file matchers of configs/MI455X/deepseek_v3-MXFP8-bf16-*-te-precision.yaml.
 export PRIMUS_MXFP8=${PRIMUS_MXFP8:-}
 case "${PRIMUS_MXFP8,,}" in
     "" | off | experts | dense | dense_experts) ;;
@@ -205,8 +205,8 @@ fi
 MX_CONFIGS=${PWD}/examples/megatron/configs/MI455X
 MXFP8_ARGS=()
 case "${PRIMUS_MXFP8,,}" in
-    experts) MXFP8_ARGS=(--te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-dense.yaml") ;;
-    dense) MXFP8_ARGS=(--use_turbo_gemm True --te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-experts.yaml") ;;
+    experts) MXFP8_ARGS=(--te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-dense-te-precision.yaml") ;;
+    dense) MXFP8_ARGS=(--use_turbo_gemm True --te_precision_config_file "${MX_CONFIGS}/deepseek_v3-MXFP8-bf16-experts-te-precision.yaml") ;;
     dense_experts) MXFP8_ARGS=(--use_turbo_gemm True) ;;
 esac
 if [[ ${#MXFP8_ARGS[@]} -gt 0 ]]; then
