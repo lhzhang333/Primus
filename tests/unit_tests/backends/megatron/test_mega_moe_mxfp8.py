@@ -192,3 +192,27 @@ def test_mxfp8_wgrad_accum_pattern(mega_moe, args, monkeypatch, stage2_takes):
     x = torch.zeros(3, 32, dtype=torch.bfloat16)
     experts(x, torch.zeros(3, 2, dtype=torch.int64), torch.ones(3, 2))
     assert [c[1] for c in _CALLS] == [pattern, pattern]
+
+
+@pytest.mark.parametrize("takes_activation", [True, False], ids=["turbo_checks_it", "older_turbo"])
+def test_mxfp8_stage1_gets_the_activation_when_it_takes_it(mega_moe, args, monkeypatch, takes_activation):
+    """Primus-Turbo's mxfp8 stage1 checks stage2's activation before dispatching when it takes ``activation``: the
+    experts hand it theirs, so an activation the stages cannot compute fails before any rank sends; an older
+    stage1 gets nothing new."""
+    seen = []
+    if takes_activation:
+
+        def stage1(x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern=None, *, activation=None):
+            seen.append(activation)
+            return x, topk_weights, (), None
+
+    else:
+
+        def stage1(x, topk_idx, topk_weights, w1, group, fuse_wgrad_accum_pattern=None):
+            seen.append("not passed")
+            return x, topk_weights, (), None
+
+    monkeypatch.setattr(mega_moe, "fused_mega_moe_fp8_stage1", stage1)
+    experts = _experts(mega_moe, "MegaMoEFP8Experts", _config())
+    experts(torch.zeros(3, 32, dtype=torch.bfloat16), torch.zeros(3, 2, dtype=torch.int64), torch.ones(3, 2))
+    assert seen == [experts.activation if takes_activation else "not passed"]

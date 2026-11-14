@@ -140,6 +140,15 @@ def _log_once(message: str) -> None:
 
 
 @functools.lru_cache(maxsize=None)
+def _takes_keyword(fn, name: str) -> bool:
+    """Whether ``fn`` (a Primus-Turbo op) takes the argument ``name``."""
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+@functools.lru_cache(maxsize=None)
 def _turbo_stages_take_wgrad_accum(stages=None) -> bool:
     """Whether this Primus-Turbo's staged MegaMoE ops (``stages``; None: the bf16 pair) take
     ``fuse_wgrad_accum_pattern`` (logged once)."""
@@ -330,9 +339,14 @@ class MegaMoEFP8Experts(MegaMoEExperts):
     def forward(self, x, topk_idx, topk_weights):
         # only passed when set, so a Primus-Turbo without the argument still runs
         accum = {"fuse_wgrad_accum_pattern": self.wgrad_accum_pattern} if self.wgrad_accum_pattern else {}
+        # stage1 checks stage2's activation before its dispatch prologue (where this Primus-Turbo takes it), so an
+        # activation the stages cannot compute fails before any rank has sent anything
+        act = (
+            {"activation": self.activation} if _takes_keyword(fused_mega_moe_fp8_stage1, "activation") else {}
+        )
         w1, b1 = self.fc1_weight()
         l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(
-            x, topk_idx, topk_weights, w1, self.ep_group, **accum
+            x, topk_idx, topk_weights, w1, self.ep_group, **accum, **act
         )
         w2, b2 = self.fc2_weight()
         return fused_mega_moe_fp8_stage2(
