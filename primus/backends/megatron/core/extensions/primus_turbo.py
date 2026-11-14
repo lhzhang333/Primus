@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import os
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -279,8 +278,8 @@ def _turbo_rmsnorm_mxfp8():
 def _mxfp8_activation_recipes(weight) -> Tuple[ScalingRecipe, ScalingRecipe]:
     """(row, column) scaling recipes a prequantized MXFP8 input of ``gemm_fp8(a, weight)`` must carry:
     Primus-Turbo's MX GEMM layouts (packed scales; plus 16x16 codes for the column copy, wgrad's B operand)
-    when that GEMM runs on them, raw ones otherwise. ``weight``: the bf16 parameter (its cache is made in the
-    matching layout, see ``_mx_weight_layout_recipe``) or that cached QuantizedTensor (or pair)."""
+    when that GEMM runs on them, raw ones otherwise. ``weight``: the bf16 parameter (Primus-Turbo makes its cache in
+    the matching layout) or that cached QuantizedTensor (or pair)."""
     from primus_turbo.pytorch.ops.utils import MX_A, MX_B, mx_gemm_layout
 
     if PrimusTurboQuantizedTensorPair is not None and isinstance(weight, PrimusTurboQuantizedTensorPair):
@@ -848,34 +847,6 @@ def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantCon
     return ScalingRecipe()
 
 
-def _mx_weight_layout_recipe(
-    quant_config: Union[Float4QuantConfig, Float8QuantConfig], weight: torch.Tensor
-) -> Optional[ScalingRecipe]:
-    """Recipe of the cached MXFP8 copies of ``weight`` on gfx1250, whose FlyDSL GEMMs read their own layout (E8M0
-    scales packed as ``[rows/32][K/128][32][4]``, codes in 16x16-preshuffled tiles): Primus-Turbo's
-    ``mx_weight_layout_recipe(grouped, shape)``, which returns that layout only once the backend of the op kind --
-    dense (a 2-D weight) or grouped / the fused grouped MLP (the 3-D expert stack) -- consumes it, and only for a
-    shape it fits. ``None`` (Turbo's default, raw layout): other archs or recipes, or a Primus-Turbo without the
-    query."""
-    if not (
-        isinstance(quant_config, Float8QuantConfig)
-        and quant_config.granularity == ScalingGranularity.MX_BLOCKWISE
-        and _is_gfx1250()
-    ):
-        return None
-    query = getattr(primus_turbo_torch.ops, "mx_weight_layout_recipe", None)
-    return None if query is None else query(weight.dim() == 3, shape=tuple(weight.shape))
-
-
-@lru_cache(maxsize=None)
-def _takes_scaling_recipe(fn) -> bool:
-    """Whether Primus-Turbo's ``create_quantized_weight`` takes a ``scaling_recipe`` (newer builds)."""
-    try:
-        return "scaling_recipe" in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 def _not_leaves(*copies):
     """The cached quantized copies of a weight, as tensors that do not require grad (anything else, such as a
     missing transpose copy, passes through unchanged).
@@ -901,9 +872,8 @@ def _maybe_create_quantized_weight_buffers(
     (colwise) buffer, returning ``(rowwise, colwise_or_None)``.
 
     Prefers primus_turbo's ``create_quantized_weight`` helper, which picks the
-    scaling recipe from the quant config and handles per-granularity transpose;
-    it is handed the recipe of :func:`_mx_weight_layout_recipe` when there is one
-    and it takes a ``scaling_recipe``.
+    scaling recipe from the quant config and handles per-granularity transpose
+    (an MXFP8 weight on gfx1250: the layout its GEMMs read there).
     Falls back to a manual rowwise/colwise quantize on older primus_turbo builds
     that do not export ``create_quantized_weight`` yet.
     """
@@ -911,17 +881,12 @@ def _maybe_create_quantized_weight_buffers(
     need_weight_transpose_cache = not disable_parameter_transpose_cache
 
     if create_quantized_weight is not None:
-        kwargs = {}
-        recipe = _mx_weight_layout_recipe(quant_config_internal, weight)
-        if recipe is not None and _takes_scaling_recipe(create_quantized_weight):
-            kwargs["scaling_recipe"] = recipe
         return _not_leaves(
             *create_quantized_weight(
                 weight,
                 dest_dtype,
                 quant_config_internal,
                 need_weight_transpose_cache=need_weight_transpose_cache,
-                **kwargs,
             )
         )
 
