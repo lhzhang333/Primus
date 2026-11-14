@@ -64,28 +64,39 @@ def _is_silu(activation_func) -> bool:
 
 
 def mega_moe_activation(config: TransformerConfig) -> Optional[GLUActivation]:
-    """The MegaMoE kernel activation for ``config``; ``None`` keeps the kernels' default, SiLU-SwiGLU
-    with the gate and ``up`` both clamped to [-10, 10].
+    """The MegaMoE kernel activation for ``config``, one rule for both expert flavours (bf16 and mxfp8) on
+    every arch; ``None`` keeps the kernels' default, SiLU-SwiGLU with the gate and ``up`` both clamped to
+    [-10, 10].
 
-    ``quick_gelu`` is Megatron's ``quick_geglu``: ``g * sigmoid(1.702 g) * (u + glu_linear_offset)``
-    with the gate clamped from above only and ``up`` on both sides by ``activation_func_clamp_value``
-    (``moe/experts.py``), which is MiniMax-M3's ``swigluoai``.
+    - SiLU without ``activation_func_clamp_value`` is the plain SwiGLU Megatron computes,
+      ``silu(g) * (u + glu_linear_offset)`` (DeepSeek-V3's, offset 0): no clamp at all (a bound left None
+      costs the kernels no instruction) and the configured offset.
+    - SiLU with ``activation_func_clamp_value`` set keeps the default, whatever the value: DeepSeek-V4 runs
+      MegaMoE with a SiLU config that sets 10, and honouring it would change that model's numerics. Megatron
+      clamps that gate from above only, so at 10 the two differ only for a gate below -10, whose SiLU and its
+      slope are under 5e-4 in magnitude. The default has no offset, so such a config must not set one.
+    - ``quick_gelu`` is Megatron's ``quick_geglu``: ``g * sigmoid(1.702 g) * (u + glu_linear_offset)`` with
+      the gate clamped from above only and ``up`` on both sides by ``activation_func_clamp_value``
+      (``moe/experts.py``), which is MiniMax-M3's and GPT-OSS's ``swigluoai``.
 
-    SiLU without ``activation_func_clamp_value`` is the plain SwiGLU Megatron computes (DeepSeek-V3's),
-    so it gets no clamp at all; a bound left None costs the kernels no instruction. SiLU with it set
-    keeps the default, whatever the value: DeepSeek-V4 runs MegaMoE with a SiLU config that sets 10,
-    and honouring it would change that model's numerics. Megatron clamps that gate from above only, so
-    at 10 the two differ only for a gate below -10, whose SiLU and its slope are under 5e-4 in magnitude.
+    Which of these a kernel computes is Primus-Turbo's call, and it raises on the others: gfx1250's MXFP8
+    stages, for one, take SiLU-SwiGLU without an offset, unclamped or with Megatron's clamp.
     """
-    if _is_silu(config.activation_func):
-        if config.activation_func_clamp_value is not None:
-            return None
-        return GLUActivation(gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None)
-    assert config.activation_func is quick_gelu, f"no MegaMoE activation for {config.activation_func!r}"
+    offset = float(config.glu_linear_offset)
     limit = config.activation_func_clamp_value
+    if _is_silu(config.activation_func):
+        if limit is None:
+            return GLUActivation(glu_offset=offset, gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None)
+        if offset:
+            raise ValueError(
+                "MegaMoE: a SiLU config with activation_func_clamp_value set runs the kernels' clamped "
+                f"SwiGLU, which has no glu_linear_offset; got glu_linear_offset={offset}"
+            )
+        return None
+    assert config.activation_func is quick_gelu, f"no MegaMoE activation for {config.activation_func!r}"
     return GLUActivation(
         alpha=_QUICK_GELU_ALPHA,
-        glu_offset=float(config.glu_linear_offset),
+        glu_offset=offset,
         gate_clamp_lo=None,
         gate_clamp_hi=limit,
         up_clamp=limit,
