@@ -311,6 +311,37 @@ def _bf16_grouped_wgrad_can_accumulate() -> bool:
     return backend is None or getattr(backend, "name", None) in _BF16_WGRAD_ACCUM_BACKENDS
 
 
+def _mxfp8_wgrad_can_accumulate(weight: torch.Tensor) -> bool:
+    """Whether the MXFP8 wgrad of ``weight`` may add straight into its ``main_grad`` (beta=1).
+
+    Only on gfx1250, for a bf16 weight with a bf16 main_grad (``main_grads_dtype: bf16``), and only when the
+    installed Primus-Turbo says the MXFP8 wgrad backend it would run (dense for a 2-D weight, grouped for the 3-D
+    expert stack; a pinned FP8 backend included) has a beta=1 epilogue for that dtype
+    (:func:`_mx_wgrad_accum_supported`). A Primus-Turbo that cannot be asked keeps the framework's separate add, so
+    main_grad is never written by a GEMM that would overwrite it.
+    """
+    main_grad = getattr(weight, "main_grad", None)
+    if weight.dtype != torch.bfloat16 or not isinstance(main_grad, torch.Tensor):
+        return False
+    if main_grad.dtype != torch.bfloat16:
+        return False
+    return _mx_wgrad_accum_supported(weight.dim() == 3, main_grad.dtype)
+
+
+@lru_cache(maxsize=None)
+def _mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+    """Primus-Turbo's ``mx_wgrad_accum_supported``, on gfx1250 only, asked once per (grouped, dtype) and process:
+    the linears publish the GEMM backends at construction, before their first forward asks. Elsewhere (gfx950's
+    MXFP8 GEMMs have the epilogue too) the separate add stays, so no other arch's rounding changes."""
+    if not _is_gfx1250():
+        return False
+    try:
+        from primus_turbo.pytorch.ops import mx_wgrad_accum_supported
+    except ImportError:
+        return False
+    return bool(mx_wgrad_accum_supported(grouped, main_grad_dtype))
+
+
 def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:
     """Returns a dummy tensor of given shape.
 
@@ -426,10 +457,12 @@ def _fuse_wgrad_accum_pattern(config, weight: torch.Tensor) -> Optional[str]:
     beta=1 epilogue, replacing the separate elementwise add the framework would run
     over the whole gradient buffer. It is driven by ``gradient_accumulation_fusion``.
 
-    Only the BF16/FP16 GEMMs, the FP8 current-scaling (tensorwise) ones, and
-    non-preshuffled MXFP4 GEMMs (FlyDSL ``gemm_fp4_accum_impl``) carry that
-    epilogue. FP8 block / MXFP8 scaling and preshuffled or non-MX FP4 recipes
-    keep the framework's separate add.
+    Only the BF16/FP16 GEMMs, the FP8 current-scaling (tensorwise) ones,
+    non-preshuffled MXFP4 GEMMs (FlyDSL ``gemm_fp4_accum_impl``) and MXFP8 GEMMs
+    whose backend Primus-Turbo reports as accumulating into a bf16 main_grad
+    (:func:`_mxfp8_wgrad_can_accumulate`) carry that epilogue. FP8 block scaling,
+    other MXFP8 cases and preshuffled or non-MX FP4 recipes keep the framework's
+    separate add.
 
     ``weight`` must be the real parameter, not a quantized buffer: the buffer carries
     no ``main_grad``. On the multi-microbatch path the parameter's attributes are
@@ -453,7 +486,12 @@ def _fuse_wgrad_accum_pattern(config, weight: torch.Tensor) -> Optional[str]:
             return None
     elif PrimusTurboLowPrecisionGlobalStateManager.is_turbo_fp8_enabled():
         quant_config = PrimusTurboLowPrecisionGlobalStateManager.get_turbo_quant_config()
-        if quant_config is None or not quant_config.current_scaling():
+        if quant_config is None:
+            return None
+        if quant_config.mxfp8_scaling():
+            if not _mxfp8_wgrad_can_accumulate(weight):
+                return None
+        elif not quant_config.current_scaling():
             return None
     elif weight.dtype not in (torch.bfloat16, torch.float16):
         return None
