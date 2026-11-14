@@ -236,6 +236,57 @@ def _bridge_activation_grad(
     return PrimusTurboQuantizedTensorPair(data=rowwise, data_t=colwise)
 
 
+# The dense MLP MXFP8 patch (patches/turbo/dense_mlp_mxfp8_patches.py) routes a Megatron MLP through Primus-Turbo's
+# mlp_fp8 only where both of its linears run the same Turbo MXFP8 recipe; the decision is memoized per module.
+
+
+def _quant_recipe_key(quant) -> Optional[tuple]:
+    """The value of a PrimusTurboQuantConfig as a hashable key (None stays None). Primus' ``get_fp8_context``
+    builds a new config object per call, so memos key on this, never on the object."""
+    if quant is None:
+        return None
+    d = quant.data()
+    return (type(d).__name__, d.granularity, d.format, d.block_size, getattr(d, "strategy", None))
+
+
+def _autocast_state_key(module) -> tuple:
+    """What a module's quant decision depends on besides its own (fixed) ``te_quant_params``: train / eval and
+    the surrounding autocast state, the recipe by value."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    return (
+        module.training,
+        manager.is_fp8_enabled(),
+        manager.is_turbo_fp8_enabled(),
+        manager.is_turbo_fp4_enabled(),
+        _quant_recipe_key(manager.get_turbo_quant_config()),
+    )
+
+
+def _turbo_mxfp8_quant(linear):
+    """The Turbo MXFP8 quant config ``linear`` runs under here (its ``te_quant_params`` over the current autocast),
+    else None."""
+    manager = PrimusTurboLowPrecisionGlobalStateManager
+    with _get_fp8_autocast_for_quant_params(linear.te_quant_params, linear.training):
+        quant = manager.get_turbo_quant_config() if manager.is_turbo_fp8_enabled() else None
+        return quant if quant is not None and quant.mxfp8_scaling() else None
+
+
+def _dense_mlp_routes_to_mlp_fp8(mlp) -> bool:
+    """Whether this forward of a Megatron MLP the dense MLP MXFP8 patch enabled takes Primus-Turbo's ``mlp_fp8``:
+    both linears under the same Turbo MXFP8 recipe here. Memoized per module and autocast state (the linears'
+    ``te_quant_params`` are fixed once built)."""
+    if _use_split_wgrad_op():
+        return False
+    key = _autocast_state_key(mlp)
+    cache = mlp.__dict__.setdefault("_turbo_dense_mlp_mxfp8_route", {})
+    route = cache.get(key)
+    if route is None:
+        q1, q2 = _turbo_mxfp8_quant(mlp.linear_fc1), _turbo_mxfp8_quant(mlp.linear_fc2)
+        route = q1 is not None and q2 is not None and _quant_recipe_key(q1) == _quant_recipe_key(q2)
+        cache[key] = route
+    return route
+
+
 try:
     # Primus-Turbo since AMD-AGI/Primus-Turbo#605 caches each environment variable at its first
     # read; set_env() writes os.environ and drops that cached value
