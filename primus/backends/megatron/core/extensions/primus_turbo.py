@@ -362,6 +362,10 @@ def _bridge_weight_grad(
         @staticmethod
         def forward(ctx, x, weight, quantized_weight, quantized_weight_trans):
             ctx.save_for_backward(weight)
+            # The GEMMs return no gradient for the transpose copy (an operand of their backward only), and
+            # backward ignores it: without this, autograd would hand backward a materialized zero tensor of
+            # the full weight shape for it on every microbatch (an allocation and a memset of the whole weight).
+            ctx.set_materialize_grads(False)
             return x, quantized_weight, quantized_weight_trans
 
         @staticmethod
@@ -386,10 +390,12 @@ def _bridge_weight_grad(
                 # the dummy wgrad returned below means they are not recoverable from
                 # param.grad either. The fused path above is immune because its beta=1
                 # epilogue accumulates on every microbatch regardless of the flag.
-                if _is_gfx1250():
-                    inplace_add_triton_(weight.main_grad, grad_quantized_weight)
-                else:
-                    weight.main_grad.add_(grad_quantized_weight)
+                # set_materialize_grads(False): None when no gradient reached the copy
+                if grad_quantized_weight is not None:
+                    if _is_gfx1250():
+                        inplace_add_triton_(weight.main_grad, grad_quantized_weight)
+                    else:
+                        weight.main_grad.add_(grad_quantized_weight)
                 weight.grad_added_to_main_grad = True
 
             return grad_x, _get_dummy_wgrad(list(weight.shape), weight.dtype), None, None
