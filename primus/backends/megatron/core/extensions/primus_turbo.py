@@ -484,6 +484,20 @@ def _fuse_wgrad_accum_pattern(config, weight: torch.Tensor) -> Optional[str]:
     return "megatron"
 
 
+def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
+    """Primus-Turbo's default scaling recipe for both copies of a cached quantized weight (the manual path of
+    builds without ``create_quantized_weight``)."""
+    if isinstance(quant_config, Float4QuantConfig):
+        return ScalingRecipe(
+            use_2d_block=True,
+            shuffle_scale=quant_config.use_preshuffle,
+            shuffle_out=quant_config.use_preshuffle,
+        )
+    if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
+        return ScalingRecipe(use_2d_block=True)
+    return ScalingRecipe()
+
+
 def _not_leaves(*copies):
     """The cached quantized copies of a weight, as tensors that do not require grad (anything else, such as a
     missing transpose copy, passes through unchanged).
@@ -528,22 +542,7 @@ def _maybe_create_quantized_weight_buffers(
 
     # TODO(ruibin): Remove this fallback path once create_quantized_weight is
     # always available in the shipped primus_turbo build.
-    def _weight_scaling_recipe(quant_config: Union[Float4QuantConfig, Float8QuantConfig]) -> ScalingRecipe:
-        if isinstance(quant_config, Float4QuantConfig):
-            weight_scaling_recipe = ScalingRecipe(
-                use_2d_block=True,
-                shuffle_scale=quant_config.use_preshuffle,
-                shuffle_out=quant_config.use_preshuffle,
-            )
-
-        if isinstance(quant_config, Float8QuantConfig):
-            if quant_config.granularity in [ScalingGranularity.BLOCKWISE, ScalingGranularity.MX_BLOCKWISE]:
-                weight_scaling_recipe = ScalingRecipe(use_2d_block=True)
-            else:
-                weight_scaling_recipe = ScalingRecipe()
-
-        return weight_scaling_recipe
-
+    quant_config = quant_config_internal  # granularity / block_size / the recipe live on the Turbo config
     quantized_weight_rowwise = PrimusTurboQuantizedTensor.quantize(
         weight,
         dest_dtype=dest_dtype,
