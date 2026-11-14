@@ -31,15 +31,17 @@ def _is_turbo_mega_moe_can_patch(ctx: PatchContext) -> bool:
       - primus_turbo package is installed
       - enable_primus_turbo == True
       - use_turbo_mega_moe == True
-      - 1 < expert_model_parallel_size <= 8
+      - 1 < expert_model_parallel_size <= 8, or 1 with turbo_mega_moe_allow_ep1 (dev only: tests / bring-up)
     """
     args = get_args(ctx)
     use_turbo_mega_moe = bool(getattr(args, "use_turbo_mega_moe", False))
     bf16 = bool(getattr(args, "bf16", False))
-    # The fused all-to-all rides intra-node peer transfers, so the EP group has to fit in one node.
+    # The fused all-to-all rides intra-node peer transfers, so the EP group has to fit in one node. At EP1 it
+    # has nothing to send and only adds its protocol: dev-only turbo_mega_moe_allow_ep1 runs it there anyway.
     ep_size = int(getattr(args, "expert_model_parallel_size", 1))
+    ep_ok = 1 < ep_size <= 8 or (ep_size == 1 and bool(getattr(args, "turbo_mega_moe_allow_ep1", False)))
 
-    return use_turbo_mega_moe and bf16 and 1 < ep_size <= 8 and is_primus_turbo_can_patch(ctx)
+    return use_turbo_mega_moe and bf16 and ep_ok and is_primus_turbo_can_patch(ctx)
 
 
 def _is_turbo_mega_moe_mxfp8(ctx: PatchContext) -> bool:
@@ -74,6 +76,8 @@ def patch_mega_moe(ctx: PatchContext):
     log_rank_0(
         f"[Patch:megatron.turbo.mega_moe] Patching MoELayer with fused MegaMoE ({precision} experts)..."
     )
+    if int(getattr(get_args(ctx), "expert_model_parallel_size", 1)) == 1:
+        log_rank_0("[Patch:megatron.turbo.mega_moe]   EP1 (turbo_mega_moe_allow_ep1): tests / bring-up only")
 
     moe_layer.MoELayer = PrimusTurboMegaMoELayer
     log_rank_0(

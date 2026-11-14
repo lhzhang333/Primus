@@ -127,13 +127,26 @@ def _experts(mega_moe, cls, config):
     return getattr(mega_moe, cls)(config, 4, config.hidden_size, config.moe_ffn_hidden_size, _EPGroup())
 
 
-@pytest.mark.parametrize("ep, want", [(1, False), (2, True), (8, True), (16, False)])
-def test_mega_moe_patches_in_for_an_intra_node_ep_group(monkeypatch, ep, want):
-    """The fused all-to-all rides intra-node peer transfers: MegaMoE patches in for 1 < EP <= 8 only."""
+@pytest.mark.parametrize(
+    "ep, allow, want",
+    [
+        (1, None, False),
+        (1, False, False),
+        (1, True, True),
+        (2, False, True),
+        (8, True, True),
+        (16, True, False),
+    ],
+)
+def test_mega_moe_patches_in_for_an_intra_node_ep_group(monkeypatch, ep, allow, want):
+    """The fused all-to-all rides intra-node peer transfers: MegaMoE patches in for 1 < EP <= 8, and at EP1 only
+    with the dev-only turbo_mega_moe_allow_ep1."""
     from primus.backends.megatron.patches.turbo import mega_moe_patches as P
 
     monkeypatch.setattr(P, "is_primus_turbo_can_patch", lambda ctx: True)
     params = dict(use_turbo_mega_moe=True, bf16=True, expert_model_parallel_size=ep)
+    if allow is not None:
+        params["turbo_mega_moe_allow_ep1"] = allow
     ctx = PatchContext(
         backend="megatron",
         phase="before_train",
