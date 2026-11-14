@@ -605,21 +605,32 @@ def _bf16_grouped_wgrad_can_accumulate() -> bool:
 def _mxfp8_wgrad_can_accumulate(weight: torch.Tensor) -> bool:
     """Whether the MXFP8 wgrad of ``weight`` may add straight into its ``main_grad`` (beta=1).
 
-    Only for a bf16 weight with a bf16 main_grad (``main_grads_dtype: bf16``), and only when the installed
-    Primus-Turbo says the MXFP8 wgrad backend it would run (dense for a 2-D weight, grouped for the 3-D expert
-    stack; a pinned FP8 backend included) has a beta=1 epilogue for that dtype. A Primus-Turbo that cannot be
-    asked keeps the framework's separate add, so main_grad is never written by a GEMM that would overwrite it.
+    Only on gfx1250, for a bf16 weight with a bf16 main_grad (``main_grads_dtype: bf16``), and only when the
+    installed Primus-Turbo says the MXFP8 wgrad backend it would run (dense for a 2-D weight, grouped for the 3-D
+    expert stack; a pinned FP8 backend included) has a beta=1 epilogue for that dtype
+    (:func:`_mx_wgrad_accum_supported`). A Primus-Turbo that cannot be asked keeps the framework's separate add, so
+    main_grad is never written by a GEMM that would overwrite it.
     """
     main_grad = getattr(weight, "main_grad", None)
     if weight.dtype != torch.bfloat16 or not isinstance(main_grad, torch.Tensor):
         return False
     if main_grad.dtype != torch.bfloat16:
         return False
+    return _mx_wgrad_accum_supported(weight.dim() == 3, main_grad.dtype)
+
+
+@lru_cache(maxsize=None)
+def _mx_wgrad_accum_supported(grouped: bool, main_grad_dtype: torch.dtype) -> bool:
+    """Primus-Turbo's ``mx_wgrad_accum_supported``, on gfx1250 only, asked once per (grouped, dtype) and process:
+    the linears publish the GEMM backends at construction, before their first forward asks. Elsewhere (gfx950's
+    MXFP8 GEMMs have the epilogue too) the separate add stays, so this patch set changes no other arch's rounding."""
+    if not _is_gfx1250():
+        return False
     try:
         from primus_turbo.pytorch.ops import mx_wgrad_accum_supported
     except ImportError:
         return False
-    return bool(mx_wgrad_accum_supported(weight.dim() == 3, main_grad.dtype))
+    return bool(mx_wgrad_accum_supported(grouped, main_grad_dtype))
 
 
 def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tensor:

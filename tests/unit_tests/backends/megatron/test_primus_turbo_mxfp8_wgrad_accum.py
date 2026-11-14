@@ -15,6 +15,7 @@ skip_if_no_cuda()
 import primus_turbo.pytorch as primus_turbo_torch  # noqa: E402  isort:skip
 from primus_turbo.pytorch.core.low_precision import check_mxfp8_support  # noqa: E402  isort:skip
 
+import primus.backends.megatron.core.extensions.primus_turbo as primus_turbo_ext  # noqa: E402  isort:skip
 from primus.backends.megatron.core.extensions.primus_turbo import (  # noqa: E402  isort:skip
     Format,
     PrimusTurboLowPrecisionGlobalStateManager,
@@ -46,6 +47,10 @@ def _turbo_mxfp8_state(monkeypatch):
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP4_ENABLED", False)
     monkeypatch.setattr(manager, "PRIMUS_TURBO_FP8_ENABLED", True)
     monkeypatch.setattr(manager, "PRIMUS_TURBO_QUANT_CONFIG", _mx_config())
+    monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: True)  # the fusion is gfx1250's only
+    primus_turbo_ext._mx_wgrad_accum_supported.cache_clear()
+    yield
+    primus_turbo_ext._mx_wgrad_accum_supported.cache_clear()
 
 
 def _weight(shape=(8, 8), *, dtype=torch.bfloat16, main_grad_dtype=torch.bfloat16, device="cpu"):
@@ -71,6 +76,22 @@ def test_bf16_main_grad_fuses_when_turbo_accumulates(monkeypatch, shape):
     calls = _turbo_answers(monkeypatch, True)
     assert _fuse_wgrad_accum_pattern(FUSION, _weight(shape)) == "megatron"
     assert calls == [(len(shape) == 3, torch.bfloat16)]  # grouped for the 3-D expert stack
+
+
+def test_asked_once_per_op_kind_and_dtype(monkeypatch):
+    """The answer is fixed per process: one Turbo query per (grouped, dtype), not one per linear per micro-batch."""
+    calls = _turbo_answers(monkeypatch, True)
+    for shape in [(8, 8), (16, 8), (2, 8, 8), (8, 8), (2, 8, 8)]:
+        assert _fuse_wgrad_accum_pattern(FUSION, _weight(shape)) == "megatron"
+    assert calls == [(False, torch.bfloat16), (True, torch.bfloat16)]
+
+
+def test_other_archs_keep_the_separate_add(monkeypatch):
+    """gfx950's MXFP8 GEMMs have the epilogue too, but the fusion stays gfx1250's: elsewhere Turbo is not asked."""
+    calls = _turbo_answers(monkeypatch, True)
+    monkeypatch.setattr(primus_turbo_ext, "_is_gfx1250", lambda: False)
+    assert _fuse_wgrad_accum_pattern(FUSION, _weight()) is None
+    assert calls == []
 
 
 def test_turbo_without_beta1_backend_fails_closed(monkeypatch):
