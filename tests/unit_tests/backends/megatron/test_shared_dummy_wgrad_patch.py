@@ -76,7 +76,12 @@ def test_needs_turbos_public_flat_pool(monkeypatch, attrs, has_pool):
 
 @pytest.fixture
 def stand_ins(monkeypatch):
-    """TE's base module (and a module that imported its helper by name) and the extension, as stand-ins."""
+    """TE's base module (and a module that imported its helper by name) and the extension, as stand-ins. The real
+    extension, if this process imported it, must come out untouched."""
+    import primus.backends.megatron.core.extensions as extensions
+
+    real = getattr(extensions, "primus_turbo", None)
+    real_before = getattr(real, "_shared_dummy_wgrad", None)
 
     def te_helper(shape, dtype, zero=False):
         return "te"
@@ -92,7 +97,8 @@ def stand_ins(monkeypatch):
     for module in (te_base, user, ext):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(P.torch.cuda, "current_device", lambda: 0)
-    return te_base, user, ext, te_helper
+    yield te_base, user, ext, te_helper
+    assert getattr(real, "_shared_dummy_wgrad", None) is real_before, "the patch reached the real extension"
 
 
 def test_patch_points_te_and_the_extension_at_the_pool(monkeypatch, stand_ins):

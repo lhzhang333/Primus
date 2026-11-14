@@ -77,9 +77,10 @@ def patch_shared_dummy_wgrad(ctx: PatchContext) -> None:
             "own dummy buffers."
         )
         return
-    import transformer_engine.pytorch.module.base as te_base
-
-    import primus.backends.megatron.core.extensions.primus_turbo as primus_turbo_ext
+    # importlib, not "import a.b as c": that resolves through the parent package's attributes, while
+    # import_module returns the module sys.modules holds (the same one in a run; the stand-in in a test)
+    te_base = importlib.import_module("transformer_engine.pytorch.module.base")
+    primus_turbo_ext = importlib.import_module("primus.backends.megatron.core.extensions.primus_turbo")
 
     if is_patched(te_base, _PATCH_KEY) or not hasattr(te_base, "get_dummy_wgrad"):
         return
