@@ -44,6 +44,7 @@ def stub_types(monkeypatch):
     monkeypatch.delenv("PRIMUS_TURBO_FUSED_GEMM", raising=False)
     monkeypatch.setattr(patch, "_turbo_linear_types", lambda: ((_Fc1,), (_Fc2,)))
     monkeypatch.setattr(patch, "_mlp_fp8_op", lambda: object())
+    monkeypatch.setattr(patch, "is_gfx1250", lambda: True)
 
 
 def _mlp(cfg=None, fc1=None, fc2=None):
@@ -80,6 +81,18 @@ def test_env_switch_overrides_the_arg(stub_types, monkeypatch):
     monkeypatch.setenv("PRIMUS_TURBO_FUSED_DENSE_MLP", "1")
     assert patch._should_enable(_mlp(), _args(turbo_fused_gemm=False), is_expert=False)
     monkeypatch.setenv("PRIMUS_TURBO_FUSED_DENSE_MLP", "0")
+    assert not patch._should_enable(_mlp(), _args(), is_expert=False)
+
+
+def test_gfx1250_only(stub_types, monkeypatch):
+    """mlp_fp8 runs on gfx1250 alone: elsewhere neither the patch nor a module takes it, whatever the switch."""
+    from primus.core.patches import PatchContext
+
+    ctx = PatchContext(backend="megatron", phase="before_train",
+                       extra={"module_config": SimpleNamespace(params=_args())})  # fmt: skip
+    assert patch._patch_condition(ctx)
+    monkeypatch.setattr(patch, "is_gfx1250", lambda: False)
+    assert not patch._patch_condition(ctx)
     assert not patch._should_enable(_mlp(), _args(), is_expert=False)
 
 

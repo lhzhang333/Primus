@@ -19,9 +19,10 @@ Primus-Turbo's ``mx_weight_layout_recipe`` asks for) and the wgrads reach ``main
     YAML  turbo_fused_gemm: true
     env   PRIMUS_TURBO_FUSED_DENSE_MLP=1   (overrides YAML)
 
-under ``--fp8 e4m3 --fp8_recipe mxfp8`` and ``use_turbo_gemm``. Per forward, a module takes the op only where both
-of its linears run the same Turbo MXFP8 recipe (a BF16 matcher of ``te_precision_config_file`` or a BF16 autocast
-keeps Megatron's path); routed experts never do.
+under ``--fp8 e4m3 --fp8_recipe mxfp8`` and ``use_turbo_gemm``, on gfx1250 only (Primus-Turbo's ``mlp_fp8`` raises
+on other archs; there the switch keeps meaning the MXFP4 dense MLP alone). Per forward, a module takes the op only
+where both of its linears run the same Turbo MXFP8 recipe (a BF16 matcher of ``te_precision_config_file`` or a BF16
+autocast keeps Megatron's path); routed experts never do.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from primus.backends.megatron.patches.turbo.dense_mlp_fp4_patches import (
     _run_module_forward_pre_hooks,
 )
 from primus.core.patches import PatchContext, get_args, register_patch
+from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import log_rank_0
 
 _PATCH_KEY = "megatron.mlp.turbo_dense_mlp_mxfp8"
@@ -65,10 +67,16 @@ def _mxfp8_recipe(args) -> bool:
     return bool(getattr(args, "fp8", None)) and getattr(args, "fp8_recipe", None) == "mxfp8"
 
 
+def _requested_here(args) -> bool:
+    """The switch, under the MXFP8 recipe, on gfx1250 (the only arch ``mlp_fp8`` runs on); the arch is probed
+    last."""
+    return _fused_dense_mlp_requested(args) and _mxfp8_recipe(args) and is_gfx1250()
+
+
 def _should_enable(mlp, args, is_expert: bool) -> bool:
-    """Whether a constructed Megatron MLP may take ``mlp_fp8``: switch on under the MXFP8 recipe with Turbo linears,
-    not an expert, SwiGLU without bias, clamp or GLU offset (the op's math)."""
-    if is_expert or not (_fused_dense_mlp_requested(args) and _mxfp8_recipe(args)):
+    """Whether a constructed Megatron MLP may take ``mlp_fp8``: switch on under the MXFP8 recipe on gfx1250 with
+    Turbo linears, not an expert, SwiGLU without bias, clamp or GLU offset (the op's math)."""
+    if is_expert or not _requested_here(args):
         return False
     if not getattr(args, "use_turbo_gemm", False) or _mlp_fp8_op() is None:
         return False
@@ -190,8 +198,7 @@ def _install_dense_mlp_mxfp8_patch() -> None:
 
 
 def _patch_condition(ctx: PatchContext) -> bool:
-    args = get_args(ctx)
-    return _fused_dense_mlp_requested(args) and _mxfp8_recipe(args)
+    return _requested_here(get_args(ctx))
 
 
 @register_patch(
@@ -200,7 +207,7 @@ def _patch_condition(ctx: PatchContext) -> bool:
     phase="before_train",
     description=(
         "Route the non-expert SwiGLU MLPs (DeepSeek-V3 shared experts) through Primus-Turbo's MXFP8 mlp_fp8 "
-        "(fused GLU / dGLU dual casts, cached weights, wgrad into main_grad) when turbo_fused_gemm is set."
+        "(fused GLU / dGLU dual casts, cached weights, wgrad into main_grad) when turbo_fused_gemm is set (gfx1250)."
     ),
     priority=60,
     condition=_patch_condition,

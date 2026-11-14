@@ -20,10 +20,11 @@ from primus.core.patches.patch_registry import PatchRegistry
 # patch id -> the module that registers it
 _PATCHES = {
     "megatron.turbo.mxfp8_fused_norm": "primus.backends.megatron.patches.turbo.mxfp8_fused_norm_patches",
+    "megatron.mlp.turbo_dense_mlp_mxfp8": "primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches",
 }
 
 _EXTENSION = "primus.backends.megatron.core.extensions.primus_turbo"
-_SWITCH_ENVS = ("PRIMUS_MXFP8_FUSED_NORM",)
+_SWITCH_ENVS = ("PRIMUS_MXFP8_FUSED_NORM", "PRIMUS_TURBO_FUSED_DENSE_MLP", "PRIMUS_TURBO_FUSED_GEMM")
 
 
 def _ctx(**params) -> PatchContext:
