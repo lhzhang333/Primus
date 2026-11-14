@@ -1,5 +1,8 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
 # See LICENSE for license information.
+###############################################################################
 
 """CPU coverage of megatron.deferred_nonfinite_checks: the NaN / Inf loss and DDP grad-norm checks are recorded
 during a schedule and evaluated with one host sync when it returns, raising what Megatron's validate_result raises
@@ -27,6 +30,7 @@ _SPEC.loader.exec_module(dn)
 
 RSM = rsm_mod.RerunStateMachine
 ORIGINAL = RSM.validate_result
+VERDICT_GROUPS = dn._verdict_groups  # the env fixture replaces it with "single rank"
 LOSS_NAN = "found NaN in local forward loss calculation"
 LOSS_INF = "found Inf in local forward loss calculation"
 
@@ -50,7 +54,7 @@ def env(monkeypatch):
     monkeypatch.setattr(RSM, "validate_result", dn.wrap_validate_result(spy))
     RSM.validate_result._primus_original = ORIGINAL  # the failure path re-runs Megatron's method
     monkeypatch.setattr(dn, "_STATE", dn.DeferredChecks())
-    monkeypatch.setattr(dn, "_world_size", lambda: 1)
+    monkeypatch.setattr(dn, "_verdict_groups", lambda: [])
     rsm = RSM(mode=rsm_mod.RerunMode.DISABLED)
     rsm.current_iteration = 41
     monkeypatch.setattr(pgb, "get_rerun_state_machine", lambda: rsm)
@@ -87,11 +91,36 @@ def expected_error(rsm, value, fn, msg):
     return str(e.value)
 
 
-def test_switch_default_off(monkeypatch):
-    monkeypatch.delenv("PRIMUS_DEFER_NONFINITE_CHECKS", raising=False)
-    assert not dn.requested()
-    monkeypatch.setenv("PRIMUS_DEFER_NONFINITE_CHECKS", "1")
-    assert dn.requested()
+def _ctx(**args):
+    return SimpleNamespace(extra={"module_config": SimpleNamespace(params=SimpleNamespace(**args))})
+
+
+@pytest.mark.parametrize(
+    "args,want",
+    [
+        ({}, False),
+        (
+            dict(defer_nonfinite_checks=False, check_for_nan_in_loss_and_grad=True, rerun_mode="disabled"),
+            False,
+        ),
+        (dict(defer_nonfinite_checks=True, check_for_nan_in_loss_and_grad=True, rerun_mode="disabled"), True),
+        # nothing to defer: Megatron's checks off, or a rerun mode (validate_result is not a plain check there)
+        (
+            dict(defer_nonfinite_checks=True, check_for_nan_in_loss_and_grad=False, rerun_mode="disabled"),
+            False,
+        ),
+        (
+            dict(
+                defer_nonfinite_checks=True,
+                check_for_nan_in_loss_and_grad=True,
+                rerun_mode="validate_results",
+            ),
+            False,
+        ),
+    ],
+)
+def test_installed_only_with_something_to_defer(args, want):
+    assert dn._enabled(_ctx(**args)) is want
 
 
 def test_finite_step_one_sync_no_immediate_checks(env):
@@ -227,25 +256,58 @@ def test_nested_wrappers_evaluate_once(env):
 def test_other_rank_failure_stops_this_rank(env, monkeypatch):
     calls = []
 
-    def all_reduce(t, op=None):
-        calls.append(op)
-        t.fill_(1)  # another rank saw a non-finite value
+    def all_reduce(t, op=None, group=None):
+        calls.append((op, group))
+        if group == "mp":
+            t.fill_(1)  # a rank of the model parallel group saw a non-finite value
 
-    monkeypatch.setattr(dn, "_world_size", lambda: 2)
+    monkeypatch.setattr(dn, "_verdict_groups", lambda: ["dp", "mp"])
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
     monkeypatch.setattr(rsm_mod, "get_rerun_state_machine", lambda: env.rsm)
     with pytest.raises(RuntimeError, match="failed on another rank"):
         step(env.rsm, [1.0, 2.0])()
-    assert calls == [torch.distributed.ReduceOp.MAX] and dn._STATE.host_syncs == 1
+    assert calls == [(torch.distributed.ReduceOp.MAX, "dp"), (torch.distributed.ReduceOp.MAX, "mp")]
+    assert dn._STATE.host_syncs == 1
 
 
 def test_all_ranks_finite_no_error(env, monkeypatch):
-    monkeypatch.setattr(dn, "_world_size", lambda: 2)
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op=None: None)
+    monkeypatch.setattr(dn, "_verdict_groups", lambda: ["dp"])
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op=None, group=None: None)
     step(env.rsm, [1.0])()
-    dn.wrap_schedule(lambda: None)()  # no checks on this rank: still joins the all-reduce
+    dn.wrap_schedule(lambda: None)()  # no checks on this rank: it still joins the all-reduce
     assert dn._STATE.host_syncs == 2
+
+
+def test_single_rank_without_checks_does_not_sync(env):
+    dn.wrap_schedule(lambda: None)()
+    assert dn._STATE.host_syncs == 0
+
+
+def test_verdict_groups_are_the_training_groups(monkeypatch):
+    """Data parallel (with context parallel) and model parallel, not WORLD; size-1 groups are skipped."""
+    mpu = pytest.importorskip("megatron.core.parallel_state")
+    dist = torch.distributed
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    sizes = {"dp+cp": 4, "tp+pp": 1, None: 16}
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: sizes[group])
+    monkeypatch.setattr(mpu, "model_parallel_is_initialized", lambda: True)
+    seen = {}
+
+    def dp_group(**kw):
+        seen.update(kw)
+        return "dp+cp"
+
+    monkeypatch.setattr(mpu, "get_data_parallel_group", dp_group)
+    monkeypatch.setattr(mpu, "get_model_parallel_group", lambda: "tp+pp")
+    assert VERDICT_GROUPS() == ["dp+cp"] and seen == {"with_context_parallel": True}
+    sizes["tp+pp"] = 2
+    assert VERDICT_GROUPS() == ["dp+cp", "tp+pp"]
+    monkeypatch.setattr(mpu, "model_parallel_is_initialized", lambda: False)
+    assert VERDICT_GROUPS() == [None]  # outside Megatron's parallel state: WORLD
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    assert VERDICT_GROUPS() == []
 
 
 def test_install_wraps_getters_and_validate_result_once(monkeypatch):

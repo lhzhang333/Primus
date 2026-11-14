@@ -121,14 +121,33 @@ te_ce_overwrite_input: true
 # only (other cases keep TE). Same logits caveat as te_ce_overwrite_input;
 # cannot be combined with use_turbo_cross_entropy.
 deferred_cross_entropy: false
+# Call TE parallel_cross_entropy with is_cg_capturable=True: its backward then skips
+# a blocking host-to-device copy (a host sync per micro-batch) that only serves a
+# shortcut for a scalar loss gradient, which Megatron's per-token loss never has.
+# Same result bit for bit. With deferred_cross_entropy, only the calls the deferred
+# path hands back to TE get the flag.
+te_cross_entropy_cg_capturable: false
 
-# Embedding wgrad straight into main_grad: the token rows are added into the
-# word embedding's main_grad (sorted, deterministic index_put_ accumulate) instead
-# of a dense table-sized gradient being zero-filled every micro-batch and then
-# added in full (DeepSeek-V3: 1.73 GiB). TP=1, gradient_accumulation_fusion, not
-# for a weight with zero_out_wgrad (tied output layer / MTP). Env
-# PRIMUS_EMBEDDING_WGRAD_FUSION overrides.
+# Embedding wgrad straight into main_grad: each touched row's token sum (the dense
+# gradient's per-row sums, from a stable sort of the ids) is added into the word
+# embedding's main_grad, instead of a dense table-sized gradient being zero-filled
+# every micro-batch and then added in full. Bitwise the unfused result. TP=1,
+# gradient_accumulation_fusion, not in deterministic_mode, not for a weight with
+# zero_out_wgrad (tied output layer / MTP).
 embedding_wgrad_fusion: false
+
+# ===== Host syncs =====
+# MoE all-to-all dispatcher: skip the D2H event wait of a dispatch whose D2H point
+# copied nothing to the host (EP = TP = 1, dropless, fused permute, and
+# tokens_per_expert kept on the device by use_turbo_grouped_gemm). Any host copy
+# keeps the wait. No numerical change.
+moe_skip_idle_dtoh_sync: false
+# Record the NaN/Inf checks of the loss and of the DDP bucket grad norms
+# (check_for_nan_in_loss_and_grad, rerun_mode: disabled) during forward_backward_func
+# and evaluate them with one host sync when it returns, before the optimizer step.
+# A failure raises the same error, after the step's remaining micro-batches; no
+# update is applied. No numerical change.
+defer_nonfinite_checks: false
 
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32

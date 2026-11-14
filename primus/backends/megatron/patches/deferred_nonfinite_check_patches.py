@@ -29,9 +29,10 @@ iteration, same tracker-file line). Differences, by design:
 * the loss in the message is a detached copy: its repr has no ``grad_fn=<...>``. Grad norms keep their dtype and
   have no ``grad_fn``: their repr is unchanged.
 * no update with non-finite values: the evaluation runs inside ``forward_backward_func``, before ``train_step``
-  calls ``optimizer.step()``. With more than one rank the local verdict is all-reduced (MAX) first, so every rank
-  raises: a rank whose own checks passed raises a RuntimeError saying a deferred check failed on another rank
-  (without the patch it would wait in the failed rank's next collective).
+  calls ``optimizer.step()``. With more than one rank the local verdict is first all-reduced (MAX) over the data
+  parallel group (with context parallel) and then the model parallel group -- every rank of the training job, and
+  no rank outside it -- so every rank raises: a rank whose own checks passed raises a RuntimeError saying a deferred
+  check failed on another rank (without the patch it would wait in the failed rank's next collective).
 
 Only fatal ``torch.isnan`` / ``torch.isinf`` checks of single-element tensors with the messages above, in
 ``RerunMode.DISABLED``, called while a wrapped schedule runs, are deferred. Every other ``validate_result`` call
@@ -39,9 +40,12 @@ Only fatal ``torch.isnan`` / ``torch.isinf`` checks of single-element tensors wi
 outside a schedule) runs as before; if the schedule is not wrapped, nothing is deferred. An exception inside the
 schedule drops the recorded checks.
 
-Opt-in (default off):
+Opt-in (default off); installed only when Megatron's checks are on and reruns are disabled, the only case with
+something to defer:
 
-    env   PRIMUS_DEFER_NONFINITE_CHECKS=1
+    defer_nonfinite_checks: true
+    check_for_nan_in_loss_and_grad: true
+    rerun_mode: disabled
 """
 
 from __future__ import annotations
@@ -53,11 +57,10 @@ from collections import OrderedDict
 
 import torch
 
-from primus.core.patches import PatchContext, register_patch
+from primus.core.patches import PatchContext, get_args, register_patch
 from primus.core.utils.module_utils import log_rank_0
 
 _PATCH_KEY = "megatron.deferred_nonfinite_checks"
-_ENV = "PRIMUS_DEFER_NONFINITE_CHECKS"
 _MARK = "_primus_deferred_nonfinite"
 DEFERRED_MESSAGE_PREFIXES = (
     "found NaN in local forward loss calculation",  # pretrain_gpt.loss_func
@@ -67,13 +70,28 @@ DEFERRED_MESSAGE_PREFIXES = (
 )
 
 
-def requested() -> bool:
-    return os.environ.get(_ENV, "0") not in ("0", "", "false", "False")
+def _enabled(ctx: PatchContext) -> bool:
+    args = get_args(ctx)
+    return (
+        bool(getattr(args, "defer_nonfinite_checks", False))
+        and bool(getattr(args, "check_for_nan_in_loss_and_grad", False))
+        and str(getattr(args, "rerun_mode", "disabled")) == "disabled"
+    )
 
 
-def _world_size() -> int:
+def _verdict_groups() -> list:
+    """The process groups the verdict is all-reduced over: the data parallel group (with context parallel), then
+    the model parallel group. A MAX over both reaches every rank of the training job and none outside it (WORLD can
+    hold other ranks, e.g. RL inference workers). Outside Megatron's parallel state: WORLD."""
     dist = torch.distributed
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    if not (dist.is_available() and dist.is_initialized()):
+        return []
+    from megatron.core import parallel_state as mpu
+
+    if not mpu.model_parallel_is_initialized():
+        return [None] if dist.get_world_size() > 1 else []
+    groups = [mpu.get_data_parallel_group(with_context_parallel=True), mpu.get_model_parallel_group()]
+    return [g for g in groups if dist.get_world_size(g) > 1]
 
 
 class _Check:
@@ -120,8 +138,8 @@ class DeferredChecks:
         """Evaluate the recorded checks with one host sync; raise like Megatron's ``validate_result``."""
         checks = self.checks
         self.reset()
-        multi = _world_size() > 1
-        if not checks and not multi:
+        verdict_groups = _verdict_groups()
+        if not checks and not verdict_groups:
             return
         groups = OrderedDict()
         for i, c in enumerate(checks):
@@ -134,14 +152,15 @@ class DeferredChecks:
                     for (fn, _, _), idxs in groups.items()
                 ]
             )
-        else:  # nothing checked on this rank: it still joins the all-reduce
+        else:  # nothing checked on this rank: it still joins the all-reduces
             cuda = torch.cuda.is_available()
             device = torch.device("cuda", torch.cuda.current_device()) if cuda else torch.device("cpu")
             rejected = torch.zeros(0, dtype=torch.bool, device=device)
         flags = [rejected.to(torch.int32), rejected.any().reshape(1).to(torch.int32)]
-        if multi:
+        if verdict_groups:
             verdict = flags[1].clone()
-            torch.distributed.all_reduce(verdict, op=torch.distributed.ReduceOp.MAX)
+            for group in verdict_groups:
+                torch.distributed.all_reduce(verdict, op=torch.distributed.ReduceOp.MAX, group=group)
             flags.append(verdict)
         host = torch.cat(flags).tolist()  # the one host sync
         self.host_syncs += 1
@@ -280,10 +299,10 @@ def install(rerun_state_machine_cls, *schedule_modules) -> None:
     phase="before_train",
     description=(
         "Defer the NaN/Inf loss and DDP grad-norm checks to one fused evaluation (one host sync) at the end of "
-        f"each forward_backward_func, before optimizer.step ({_ENV}=1)"
+        "each forward_backward_func, before optimizer.step (defer_nonfinite_checks)"
     ),
     priority=60,
-    condition=lambda ctx: requested(),
+    condition=_enabled,
 )
 def patch_deferred_nonfinite_checks(ctx: PatchContext) -> None:
     import megatron.core.pipeline_parallel as mpp
