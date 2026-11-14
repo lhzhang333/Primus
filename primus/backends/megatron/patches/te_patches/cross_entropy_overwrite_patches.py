@@ -16,9 +16,18 @@ default), restoring the TE <= 2.17 memory behavior.
 With the flag, the logits hold the gradient after the loss backward. Set
 ``te_ce_overwrite_input: false`` when something reads the logits after backward
 (distillation, RL log-prob reuse, logit logging hooks would see the gradient).
+
+A second, opt-in patch (``PRIMUS_TE_CE_CG_CAPTURABLE=1``, default off) passes
+``is_cg_capturable=True`` to TE: its backward then skips the blocking host-to-device
+copy of ``torch.tensor(1.0)`` (a host sync per micro-batch) and the ``torch.equal``
+it feeds, which only skips the gradient multiply when the incoming gradient is the
+scalar 1 -- Megatron's per-token loss gradient never is, so the multiply runs
+either way: bitwise the same result.
 """
 
+import functools
 import inspect
+import os
 
 from primus.core.patches import PatchContext, get_args, register_patch
 from primus.core.utils.module_utils import log_rank_0
@@ -83,3 +92,70 @@ def patch_te_cross_entropy_overwrite_input(ctx: PatchContext) -> None:
         "[Patch:megatron.te.cross_entropy_overwrite_input] TE cross entropy reuses "
         "the logits buffer for backward (overwrite_input=True)"
     )
+
+
+# ---------------------------------------------------------------------------- is_cg_capturable=True
+_CG_ENV = "PRIMUS_TE_CE_CG_CAPTURABLE"
+_CG_KEY = "megatron.te.cross_entropy_cg_capturable"
+
+
+def cg_capturable_requested() -> bool:
+    return os.environ.get(_CG_ENV, "0") not in ("0", "", "false", "False")
+
+
+def _te_fused_cross_entropy(ctx: PatchContext) -> bool:
+    args = get_args(ctx)
+    return bool(getattr(args, "cross_entropy_loss_fusion", False)) and (
+        getattr(args, "cross_entropy_fusion_impl", None) == "te"
+    )
+
+
+def make_cg_capturable_cross_entropy(original):
+    """``te_parallel_cross_entropy`` that always passes ``is_cg_capturable=True``.
+
+    TE reads the flag only in its backward (``cross_entropy_backward``): without it the backward first copies
+    ``torch.tensor(1.0)`` to the device (blocking: a host sync) and compares the incoming gradient with it
+    (``torch.equal``) to skip the gradient multiply for a scalar 1. Megatron's per-token loss gradient has another
+    shape, so ``torch.equal`` is False and the multiply runs in both cases: bitwise the same result, no sync.
+    """
+    if getattr(original, "_primus_cg_capturable", False):
+        return original
+
+    @functools.wraps(original)
+    def te_parallel_cross_entropy(logits, labels, tp_group, is_cg_capturable=False):
+        return original(logits, labels, tp_group, True)
+
+    te_parallel_cross_entropy._primus_cg_capturable = True
+    return te_parallel_cross_entropy
+
+
+def install_cg_capturable(te_ext, language_module) -> bool:
+    """Wrap the installed ``te_parallel_cross_entropy`` (Megatron's, or the overwrite_input one) in both modules."""
+    current = getattr(language_module, "te_parallel_cross_entropy", None)
+    if current is None:
+        return False
+    wrapped = make_cg_capturable_cross_entropy(current)
+    te_ext.te_parallel_cross_entropy = wrapped
+    language_module.te_parallel_cross_entropy = wrapped
+    return True
+
+
+@register_patch(
+    _CG_KEY,
+    backend="megatron",
+    phase="before_train",
+    description="TE parallel_cross_entropy with is_cg_capturable=True: no blocking H2D / torch.equal in backward",
+    # after megatron.te.cross_entropy_overwrite_input (default priority 50), whose wrapper it wraps
+    priority=60,
+    condition=lambda ctx: cg_capturable_requested() and _te_fused_cross_entropy(ctx),
+)
+def patch_te_cross_entropy_cg_capturable(ctx: PatchContext) -> None:
+    import megatron.core.extensions.transformer_engine as te_ext
+    from megatron.core.models.common.language_module import language_module
+
+    if install_cg_capturable(te_ext, language_module):
+        log_rank_0(
+            f"[Patch:{_CG_KEY}] TE cross entropy runs with is_cg_capturable=True (no host sync in backward)"
+        )
+    else:
+        log_rank_0(f"[Patch:{_CG_KEY}] no TE cross entropy installed; nothing to wrap")
