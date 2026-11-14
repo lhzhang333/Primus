@@ -129,12 +129,11 @@ def _log_once(message: str) -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def _turbo_stages_take_wgrad_accum() -> bool:
-    """Whether this Primus-Turbo's staged MegaMoE ops take ``fuse_wgrad_accum_pattern`` (logged once)."""
-    takes = all(
-        "fuse_wgrad_accum_pattern" in inspect.signature(fn).parameters
-        for fn in (fused_mega_moe_stage1, fused_mega_moe_stage2)
-    )
+def _turbo_stages_take_wgrad_accum(stages=None) -> bool:
+    """Whether this Primus-Turbo's staged MegaMoE ops (``stages``; None: the bf16 pair) take
+    ``fuse_wgrad_accum_pattern`` (logged once)."""
+    stages = stages or (fused_mega_moe_stage1, fused_mega_moe_stage2)
+    takes = all("fuse_wgrad_accum_pattern" in inspect.signature(fn).parameters for fn in stages)
     if not takes:
         log_rank_0(
             "[MegaMoE] this Primus-Turbo's staged ops cannot accumulate the expert wgrads into "
@@ -300,16 +299,17 @@ class MegaMoEFP8Experts(MegaMoEExperts):
     """MXFP8 sibling: same parameters and same two-stage shape, different stage pair.
 
     The fp8 stages thread an extra opaque ``state`` from stage1 to stage2, which carries the
-    quantized operands that cannot ride autograd's gradient slots.
+    quantized operands that cannot ride autograd's gradient slots. They get ``fuse_wgrad_accum_pattern`` (the
+    wgrads add into a bf16 ``main_grad``) when wgrad fusion is on and this Primus-Turbo's mxfp8 stages take it.
     """
 
     def _wgrad_accum_pattern(self, config: TransformerConfig) -> Optional[str]:
-        """None: the mxfp8 stages take no accumulation pattern, so DDP keeps adding their wgrads."""
-        if mega_moe_wgrad_accum_fusion(config):
-            _log_once(
-                "[MegaMoE] mxfp8 experts: the expert wgrads keep the separate main_grad add "
-                "(turbo_mega_moe_wgrad_accum_fusion applies to the bf16 experts)"
-            )
+        """``"megatron"`` when DDP's add may be fused and this Primus-Turbo's mxfp8 stages take the pattern
+        (they keep the ordinary gradient wherever they cannot accumulate into ``main_grad``)."""
+        if mega_moe_wgrad_accum_fusion(config) and _turbo_stages_take_wgrad_accum(
+            (fused_mega_moe_fp8_stage1, fused_mega_moe_fp8_stage2)
+        ):
+            return "megatron"
         return None
 
     # The mxfp8 weight-quant cache is dropped by the megatron.turbo.mega_moe_weight_generation
@@ -317,8 +317,12 @@ class MegaMoEFP8Experts(MegaMoEExperts):
     # here keeps the refresh tied to the weights actually moving, not to how often this layer
     # happens to run a forward.
     def forward(self, x, topk_idx, topk_weights):
+        # only passed when set, so a Primus-Turbo without the argument still runs
+        accum = {"fuse_wgrad_accum_pattern": self.wgrad_accum_pattern} if self.wgrad_accum_pattern else {}
         w1, b1 = self.fc1_weight()
-        l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x, topk_idx, topk_weights, w1, self.ep_group)
+        l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(
+            x, topk_idx, topk_weights, w1, self.ep_group, **accum
+        )
         w2, b2 = self.fc2_weight()
         return fused_mega_moe_fp8_stage2(
             l1_out,
@@ -332,6 +336,7 @@ class MegaMoEFP8Experts(MegaMoEExperts):
             self.activation,
             fc1_bias=b1,
             fc2_bias=b2,
+            **accum,
         )
 
 
