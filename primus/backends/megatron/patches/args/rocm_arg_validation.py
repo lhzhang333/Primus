@@ -162,6 +162,23 @@ def validate_turbo_fp8_permute(args) -> None:
         raise ValueError(f"{option}=True does not support recompute of moe_act.")
 
 
+def validate_mxfp8_on_gfx1250(args) -> None:
+    """MXFP8 on gfx1250 quantizes in Primus-Turbo's GEMMs only: TE's MXFP8 recipe does not run there, so Primus
+    keeps TE's autocast off (``fp8_utils.get_fp8_context``). A run with no Turbo GEMM would train BF16 throughout
+    behind one warning; refuse it instead."""
+    if not (getattr(args, "fp8", None) and getattr(args, "fp8_recipe", None) == "mxfp8"):
+        return
+    from primus.backends.megatron.patches.turbo.utils import turbo_quantizes_mxfp8
+    from primus.core.utils.gpu_arch import is_gfx1250
+
+    if not turbo_quantizes_mxfp8(args) and is_gfx1250():
+        raise ValueError(
+            "fp8_recipe=mxfp8 on gfx1250 quantizes only in Primus-Turbo's GEMMs (TransformerEngine's MXFP8 recipe "
+            "does not run there): set enable_primus_turbo=True with use_turbo_gemm=True and/or "
+            "use_turbo_grouped_gemm=True (or MegaMoE with turbo_mega_moe_precision=mxfp8), or train without fp8."
+        )
+
+
 def expandable_segments_requested() -> bool:
     """Return True if any allocator config env var sets ``expandable_segments:True``."""
     for env in ALLOC_CONF_ENVS:
@@ -302,6 +319,7 @@ def validate_args_on_rocm(args):
     validate_turbo_grouped_gemm_with_muon(args)
     validate_turbo_fp8_permute(args)
     # After sync-free MoE, which may auto-enable use_turbo_grouped_gemm.
+    validate_mxfp8_on_gfx1250(args)
     warn_turbo_grouped_gemm_without_expandable_segments(args)
 
     # turbo deepep
