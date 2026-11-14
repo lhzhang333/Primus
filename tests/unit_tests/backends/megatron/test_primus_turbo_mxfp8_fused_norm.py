@@ -1,5 +1,8 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """PRIMUS_MXFP8_FUSED_NORM: RMSNorm outputs handed to Primus-Turbo MXFP8 linears already quantized
 (Primus-Turbo's ``ops.normalization.rmsnorm_mxfp8``).

@@ -1,5 +1,8 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """Cached MXFP8 weights on gfx1250 take the layout Primus-Turbo's ``mx_weight_layout_recipe(grouped)`` reports for
 the op kind (dense for a 2-D weight, grouped for the 3-D expert stack); other architectures and recipes, and a

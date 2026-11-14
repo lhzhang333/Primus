@@ -692,7 +692,7 @@ def _bridge_weight_grad(
             ctx.save_for_backward(weight)
             # The GEMMs return no gradient for the transpose copy (an operand of their backward only), and
             # backward ignores it: without this, autograd would hand backward a materialized zero tensor of
-            # the full weight shape for it on every microbatch (1.75 GiB + a memset for a DeepSeek-V3 expert fc1).
+            # the full weight shape for it on every microbatch (an allocation and a memset of the whole weight).
             ctx.set_materialize_grads(False)
             return x, quantized_weight, quantized_weight_trans
 

@@ -1,8 +1,11 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """The dense MXFP8 SwiGLU MLP patch (``dense_mlp_mxfp8_patches``): which MLPs it routes to Primus-Turbo's
-``mlp_fp8`` (CPU), and on gfx1250 the routed forward / backward against today's path (the Turbo MX linears around
+``mlp_fp8`` (CPU), and on gfx1250 the routed forward / backward against the unrouted path (the Turbo MX linears around
 Megatron's SwiGLU): bitwise when that SwiGLU computes the fused kernels' bf16 values, within the activation's
 rounding otherwise; cached weights and the wgrads fused into a bf16 main_grad, one and two micro-batches."""
 
@@ -232,7 +235,7 @@ def _megatron_swiglu(l1):
 
 
 def _run(ext, routed, swiglu, micro_batches, main_grad_dtype, s, b, h, i):
-    """(out, dx) per micro-batch, then both main_grads: the patched forward, or today's path (the Turbo linears'
+    """(out, dx) per micro-batch, then both main_grads: the patched forward, or the unrouted path (the Turbo linears'
     forward_internal around ``swiglu``)."""
     fc1, fc2 = _linear(2 * i, h, 1, main_grad_dtype), _linear(h, i, 2, main_grad_dtype)
     mlp = _Stub(linear_fc1=fc1, linear_fc2=fc2, config=fc1.config, training=True)
@@ -270,8 +273,8 @@ SHAPES = [(4096, 2, 7168, 2048), (500, 2, 576, 256)]
 @pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("micro_batches", [1, 2])
 @pytest.mark.parametrize("s, b, h, i", SHAPES)
-def test_matches_todays_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_batches, main_grad_dtype):
-    """With the SwiGLU computing the fused kernels' bf16 values, the routed MLP is today's path bit for bit: the same
+def test_matches_the_unrouted_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_batches, main_grad_dtype):
+    """With the SwiGLU computing the fused kernels' bf16 values, the routed MLP is the unrouted path bit for bit: the same
     GEMMs, weight caches and MXFP8 casts (out, dx per micro-batch; both main_grads)."""
     monkeypatch.setattr(mx_state, "get_num_microbatches", lambda: micro_batches)
     got = _run(mx_state, True, None, micro_batches, main_grad_dtype, s, b, h, i)
@@ -283,7 +286,7 @@ def test_matches_todays_path_bitwise(mx_state, monkeypatch, s, b, h, i, micro_ba
 @gpu
 @pytest.mark.parametrize("s, b, h, i", SHAPES[:1])
 def test_close_to_megatron_swiglu(mx_state, monkeypatch, s, b, h, i):
-    """Against today's path with Megatron's SwiGLU: its bf16 activation (and dGLU) differ from the fused kernels' by
+    """Against the unrouted path with Megatron's SwiGLU: its bf16 activation (and dGLU) differ from the fused kernels' by
     rounding (an ulp in a few elements), which the MXFP8 casts turn into an occasional one-code change: far below
     the recipe's own error (>= 30 dB between the paths; both ~ the same SNR vs the fp32 math)."""
     monkeypatch.setattr(mx_state, "get_num_microbatches", lambda: 2)
