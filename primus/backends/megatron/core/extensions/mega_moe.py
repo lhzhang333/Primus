@@ -64,17 +64,23 @@ def _is_silu(activation_func) -> bool:
 
 
 def mega_moe_activation(config: TransformerConfig) -> Optional[GLUActivation]:
-    """The MegaMoE kernel activation for ``config``; ``None`` keeps the kernels' SiLU default.
+    """The MegaMoE kernel activation for ``config``; ``None`` keeps the kernels' default, SiLU-SwiGLU
+    with the gate and ``up`` both clamped to [-10, 10].
 
     ``quick_gelu`` is Megatron's ``quick_geglu``: ``g * sigmoid(1.702 g) * (u + glu_linear_offset)``
     with the gate clamped from above only and ``up`` on both sides by ``activation_func_clamp_value``
     (``moe/experts.py``), which is MiniMax-M3's ``swigluoai``.
 
-    SiLU always gets the default, whatever ``activation_func_clamp_value`` says: DeepSeek-V4 runs
-    MegaMoE with a SiLU config that sets it, and honouring it would change that model's numerics.
+    SiLU without ``activation_func_clamp_value`` is the plain SwiGLU Megatron computes (DeepSeek-V3's),
+    so it gets no clamp at all; a bound left None costs the kernels no instruction. SiLU with it set
+    keeps the default, whatever the value: DeepSeek-V4 runs MegaMoE with a SiLU config that sets 10,
+    and honouring it would change that model's numerics. Megatron clamps that gate from above only, so
+    at 10 the two differ only for a gate below -10, whose SiLU and its slope are under 5e-4 in magnitude.
     """
     if _is_silu(config.activation_func):
-        return None
+        if config.activation_func_clamp_value is not None:
+            return None
+        return GLUActivation(gate_clamp_lo=None, gate_clamp_hi=None, up_clamp=None)
     assert config.activation_func is quick_gelu, f"no MegaMoE activation for {config.activation_func!r}"
     limit = config.activation_func_clamp_value
     return GLUActivation(
