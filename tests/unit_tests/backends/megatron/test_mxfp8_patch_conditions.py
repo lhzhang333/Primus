@@ -10,10 +10,12 @@ are made unimportable here). Runs without a GPU."""
 
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from primus.core.config.yaml_loader import parse_yaml
 from primus.core.patches import PatchContext
 from primus.core.patches.patch_registry import PatchRegistry
 
@@ -21,37 +23,29 @@ from primus.core.patches.patch_registry import PatchRegistry
 _PATCHES = {
     "megatron.turbo.mxfp8_fused_norm": "primus.backends.megatron.patches.turbo.mxfp8_fused_norm_patches",
     "megatron.mlp.turbo_dense_mlp_mxfp8": "primus.backends.megatron.patches.turbo.dense_mlp_mxfp8_patches",
+    "megatron.te.shared_dummy_wgrad": "primus.backends.megatron.patches.te_patches.shared_dummy_wgrad_patches",
 }
 
 _EXTENSION = "primus.backends.megatron.core.extensions.primus_turbo"
 _SWITCH_ENVS = ("PRIMUS_MXFP8_FUSED_NORM", "PRIMUS_TURBO_FUSED_DENSE_MLP", "PRIMUS_TURBO_FUSED_GEMM")
 
 
-def _ctx(**params) -> PatchContext:
-    return PatchContext(
-        backend="megatron",
-        phase="before_train",
-        extra={"module_config": SimpleNamespace(params=SimpleNamespace(**params))},
-    )
+def _ctx(params) -> PatchContext:
+    return PatchContext(backend="megatron", phase="before_train", extra={"module_config": SimpleNamespace(params=params)})
 
 
-# The flags these conditions read, at their YAML defaults (primus_turbo.yaml, primus_megatron_module.yaml,
-# language_model.yaml); enable_primus_turbo is set by most example configs, so both values are covered.
-_DEFAULTS = dict(
-    fp8=None,
-    fp8_recipe="delayed",
-    fp4=None,
-    use_turbo_gemm=False,
-    use_turbo_grouped_gemm=False,
-    turbo_fused_gemm=False,
-    turbo_fused_grouped_gemm=False,
-    use_turbo_mega_moe=False,
-    gradient_accumulation_fusion=True,
-    use_precision_aware_optimizer=False,
-    moe_permute_fusion=False,
-    moe_permute_quant_fusion=False,
-    moe_backward_permute_quant_fusion=False,
-)
+_CONFIGS = Path(__file__).resolve().parents[4] / "primus/configs"
+
+
+def _default_params(**overrides) -> SimpleNamespace:
+    """The shipped defaults: the Megatron module configs and the language-model defaults (e.g.
+    gradient_accumulation_fusion: true), as a job without any of these switches gets them."""
+    params = {}
+    for name in ("models/megatron/language_model.yaml", "modules/megatron/trainer_base.yaml",
+                 "modules/megatron/primus_megatron_module.yaml", "modules/megatron/primus_turbo.yaml"):  # fmt: skip
+        params.update(parse_yaml(str(_CONFIGS / name)))
+    params.update(overrides)
+    return SimpleNamespace(**params)
 
 
 @pytest.fixture
@@ -69,7 +63,7 @@ def test_inert_by_default(no_turbo, patch_id, enable_primus_turbo):
     importlib.import_module(_PATCHES[patch_id])
     patch = PatchRegistry.get(patch_id)
     assert patch is not None, f"{patch_id} is not registered"
-    assert not patch.applies_to(_ctx(**_DEFAULTS, enable_primus_turbo=enable_primus_turbo))
+    assert not patch.applies_to(_ctx(_default_params(enable_primus_turbo=enable_primus_turbo)))
 
 
 # ------------------------------------------------------------------------------------------ fused RMSNorm -> MXFP8
@@ -117,4 +111,4 @@ def test_fused_norm_condition(monkeypatch, value, enable_primus_turbo, turbo_fou
 
     monkeypatch.setenv("PRIMUS_MXFP8_FUSED_NORM", value)
     monkeypatch.setattr(utils.importlib.util, "find_spec", lambda name: object() if turbo_found else None)
-    assert P._linked_site_requested(_ctx(enable_primus_turbo=enable_primus_turbo)) is want
+    assert P._linked_site_requested(_ctx(SimpleNamespace(enable_primus_turbo=enable_primus_turbo))) is want

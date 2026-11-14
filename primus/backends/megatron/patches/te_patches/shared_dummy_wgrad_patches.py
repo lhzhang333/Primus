@@ -4,50 +4,90 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""One set of dummy wgrad buffers per process: Transformer Engine's and Primus-Turbo's.
+"""Opt-in (``turbo_shared_dummy_wgrad``, default off): one pool of dummy wgrad buffers per process, Primus-Turbo's.
 
 With wgrad accumulation fused into ``main_grad``, a linear's backward still hands autograd a tensor of the
-weight's shape (never read: Megatron's grad hook sees ``grad_added_to_main_grad`` and drops it). TE
-(``transformer_engine.pytorch.module.base.get_dummy_wgrad``: TE linears and Megatron's fused-accumulation
-linears such as the LM head), Primus-Turbo (``primus_turbo.pytorch.ops.utils._get_dummy_wgrad``: its GEMMs)
-and Primus (``_get_dummy_wgrad`` of the Turbo extensions, which uses Primus-Turbo's) each keep their own
-persistent buffers. This rebinds TE's helper, everywhere it was imported, to Primus-Turbo's, so all of them
-draw on one pool: one buffer per weight shape and dtype, or, with a Primus-Turbo whose helper hands out views
-of one flat buffer per dtype, the largest weight once (DeepSeek-V3 proxy with MXFP8 experts: 7.4 GiB of
-dummies -> 1.75 GiB).
+weight's shape: Megatron's grad hook sees ``grad_added_to_main_grad`` and drops it, or (a ``zero_out_wgrad``
+weight, ``zero=True``) adds it, zeroed, into ``main_grad``. TE (``transformer_engine.pytorch.module.base.
+get_dummy_wgrad``: TE linears and Megatron's fused-accumulation linears such as the LM head), Primus-Turbo (its
+GEMMs) and the Primus-Turbo extension's linears (``_get_dummy_wgrad``) each keep their own persistent buffers.
+This patch points TE's helper, everywhere it was imported, and the extension's at Primus-Turbo's public
+``primus_turbo.pytorch.ops.get_dummy_wgrad``, so all of them draw on Primus-Turbo's pool. It applies only with
+a Primus-Turbo whose pool is one flat buffer per dtype (``DUMMY_WGRAD_FLAT_POOL``), which costs the largest
+weight once instead of one buffer per weight shape.
+
+Every dummy is then a view of one buffer, which is correct while nothing writes a dummy it was handed: the
+pool zeroes a ``zero=True`` dummy when handing it out, and DDP's hook reads it at once.
 """
+
+import importlib
+
+import torch
 
 from primus.backends.megatron.patches._patch_guard import is_patched, mark_patched
 from primus.backends.megatron.patches._rebind import rebind_everywhere
+from primus.backends.megatron.patches.turbo.utils import is_primus_turbo_can_patch
 from primus.core.patches import PatchContext, get_args, register_patch
-from primus.core.utils.module_utils import log_rank_0
+from primus.core.utils.module_utils import log_rank_0, warning_rank_0
 
 _PATCH_KEY = "megatron.te.shared_dummy_wgrad"
 
 
 def _enabled(ctx: PatchContext) -> bool:
     args = get_args(ctx)
-    return bool(getattr(args, "enable_primus_turbo", False)) and bool(
-        getattr(args, "gradient_accumulation_fusion", False)
-    )
+    if not getattr(args, "turbo_shared_dummy_wgrad", False):
+        return False
+    return bool(getattr(args, "gradient_accumulation_fusion", False)) and is_primus_turbo_can_patch(ctx)
+
+
+def turbo_flat_dummy_wgrad():
+    """Primus-Turbo's public ``get_dummy_wgrad(shape, dtype, device, zero=False)`` when its pool is one flat buffer
+    per dtype (``DUMMY_WGRAD_FLAT_POOL``), else None."""
+    try:
+        ops = importlib.import_module("primus_turbo.pytorch.ops")
+    except ImportError:
+        return None
+    helper = getattr(ops, "get_dummy_wgrad", None)
+    return helper if callable(helper) and getattr(ops, "DUMMY_WGRAD_FLAT_POOL", False) else None
+
+
+def _te_signature(helper):
+    """``helper`` in TE's ``get_dummy_wgrad(shape, dtype, zero=False)`` signature, on the current device."""
+
+    def get_dummy_wgrad(shape, dtype, zero=False):
+        return helper(list(shape), dtype, torch.device("cuda", torch.cuda.current_device()), zero=zero)
+
+    return get_dummy_wgrad
 
 
 @register_patch(
     _PATCH_KEY,
     backend="megatron",
     phase="before_train",
-    description="TE's dummy wgrad buffers shared with Primus-Turbo's (one pool per process)",
+    description="TE's and the Primus-Turbo linears' dummy wgrads from Primus-Turbo's flat pool (turbo_shared_dummy_wgrad)",
     condition=_enabled,
 )
 def patch_shared_dummy_wgrad(ctx: PatchContext) -> None:
     del ctx
-    try:
-        import transformer_engine.pytorch.module.base as te_base
-        from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad
-    except ImportError:
+    helper = turbo_flat_dummy_wgrad()
+    if helper is None:
+        warning_rank_0(
+            f"[Patch:{_PATCH_KEY}] turbo_shared_dummy_wgrad is set, but this Primus-Turbo has no flat dummy-wgrad "
+            "pool (primus_turbo.pytorch.ops.get_dummy_wgrad with DUMMY_WGRAD_FLAT_POOL): TE and Primus keep their "
+            "own dummy buffers."
+        )
         return
+    import transformer_engine.pytorch.module.base as te_base
+
+    import primus.backends.megatron.core.extensions.primus_turbo as primus_turbo_ext
+
     if is_patched(te_base, _PATCH_KEY) or not hasattr(te_base, "get_dummy_wgrad"):
         return
-    rebound = rebind_everywhere(te_base, "get_dummy_wgrad", _get_dummy_wgrad)
+    shared = _te_signature(helper)
+    rebound = rebind_everywhere(te_base, "get_dummy_wgrad", shared)
+    primus_turbo_ext._shared_dummy_wgrad = shared
     mark_patched(te_base, _PATCH_KEY)
-    log_rank_0(f"[Patch:{_PATCH_KEY}] get_dummy_wgrad -> Primus-Turbo's in {', '.join(sorted(set(rebound)))}")
+    log_rank_0(
+        f"[Patch:{_PATCH_KEY}] get_dummy_wgrad -> Primus-Turbo's flat pool in "
+        f"{', '.join(sorted(set(rebound)))} and the Primus-Turbo extension's linears"
+    )

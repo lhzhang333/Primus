@@ -122,10 +122,10 @@ from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import warning_rank_0
 
 _dummy_wgrads = {}
-try:  # one set of dummy wgrad buffers per process, shared with Primus-Turbo's GEMMs (see _get_dummy_wgrad)
-    from primus_turbo.pytorch.ops.utils import _get_dummy_wgrad as _turbo_get_dummy_wgrad
-except ImportError:
-    _turbo_get_dummy_wgrad = None
+# Primus-Turbo's public dummy-wgrad helper, ``get_dummy_wgrad(shape, dtype, zero=False)`` in TE's signature, set by the
+# megatron.te.shared_dummy_wgrad patch (turbo_shared_dummy_wgrad, default off) so that these linears draw on the pool
+# TE's and Primus-Turbo's GEMMs share. None: this module's own buffers (_get_dummy_wgrad).
+_shared_dummy_wgrad = None
 
 # A fused RMSNorm producer attaches raw MXFP4 buffers to its (deliberately
 # unwritten) BF16 autograd carrier. The next ColumnParallelLinear consumes the
@@ -641,13 +641,12 @@ def _get_dummy_wgrad(shape: list, dtype: torch.dtype, zero=False) -> torch.Tenso
     Tensors are cached by ``(shape, dtype)`` so each distinct weight layout
     only allocates one persistent buffer that gets reused across steps.
 
-    The buffers are Primus-Turbo's own (``primus_turbo.pytorch.ops.utils._get_dummy_wgrad``) when it has
-    them: with wgrad accumulation fused, the Turbo GEMM under :func:`_bridge_weight_grad` already returned a
-    dummy of the same shape and dtype, and a second persistent copy here would double the cost (2.6 GiB per
-    process for DeepSeek-V3's 32-expert stacks). The contents are never read.
+    With ``turbo_shared_dummy_wgrad`` they come from Primus-Turbo's pool instead (``_shared_dummy_wgrad``): with
+    wgrad accumulation fused, the Turbo GEMM under :func:`_bridge_weight_grad` already returned a dummy of the
+    same shape and dtype, so a second persistent buffer here doubles what the dummies cost.
     """
-    if _turbo_get_dummy_wgrad is not None:
-        return _turbo_get_dummy_wgrad(list(shape), dtype, zero=zero)
+    if _shared_dummy_wgrad is not None:
+        return _shared_dummy_wgrad(list(shape), dtype, zero=zero)
     global _dummy_wgrads
     key = (tuple(shape), dtype)
     if key not in _dummy_wgrads:

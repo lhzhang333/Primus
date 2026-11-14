@@ -54,6 +54,11 @@ use_turbo_fused_qk_rmsnorm_rope: false
 # operator switch
 # use turbo gemm
 use_turbo_gemm: false
+# One pool of dummy wgrads per process (with gradient_accumulation_fusion): TE's linears and the Primus-Turbo
+# linears take theirs from Primus-Turbo's flat dummy-wgrad pool (one buffer per dtype, the largest weight once)
+# instead of one persistent buffer per weight shape each. Needs a Primus-Turbo with that pool
+# (primus_turbo.pytorch.ops.get_dummy_wgrad, DUMMY_WGRAD_FLAT_POOL); a no-op with a warning otherwise.
+turbo_shared_dummy_wgrad: false
 # Fuse the dense SwiGLU MLP chain (fc1 + GLU + fc2) into Primus-Turbo's
 # FlyDSL dense MLP op: MXFP4 mlp_fp4 under fp4, MXFP8 mlp_fp8 (the non-expert
 # MLPs, e.g. DeepSeek-V3's shared experts) under --fp8 e4m3 --fp8_recipe mxfp8
