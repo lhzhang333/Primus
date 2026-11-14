@@ -17,17 +17,18 @@ With the flag, the logits hold the gradient after the loss backward. Set
 ``te_ce_overwrite_input: false`` when something reads the logits after backward
 (distillation, RL log-prob reuse, logit logging hooks would see the gradient).
 
-A second, opt-in patch (``PRIMUS_TE_CE_CG_CAPTURABLE=1``, default off) passes
-``is_cg_capturable=True`` to TE: its backward then skips the blocking host-to-device
-copy of ``torch.tensor(1.0)`` (a host sync per micro-batch) and the ``torch.equal``
-it feeds, which only skips the gradient multiply when the incoming gradient is the
-scalar 1 -- Megatron's per-token loss gradient never is, so the multiply runs
-either way: bitwise the same result.
+A second, opt-in patch (``te_cross_entropy_cg_capturable: true``, default off)
+passes ``is_cg_capturable=True`` to TE: its backward then skips the blocking
+host-to-device copy of ``torch.tensor(1.0)`` (a host sync per micro-batch) and the
+``torch.equal`` it feeds, which only skips the gradient multiply when the incoming
+gradient is the scalar 1 -- Megatron's per-token loss gradient never is, so the
+multiply runs either way: bitwise the same result. With
+``deferred_cross_entropy`` the deferred path is unchanged; only the calls it hands
+back to TE get the flag.
 """
 
 import functools
 import inspect
-import os
 
 from primus.core.patches import PatchContext, get_args, register_patch
 from primus.core.utils.module_utils import log_rank_0
@@ -95,18 +96,15 @@ def patch_te_cross_entropy_overwrite_input(ctx: PatchContext) -> None:
 
 
 # ---------------------------------------------------------------------------- is_cg_capturable=True
-_CG_ENV = "PRIMUS_TE_CE_CG_CAPTURABLE"
 _CG_KEY = "megatron.te.cross_entropy_cg_capturable"
 
 
-def cg_capturable_requested() -> bool:
-    return os.environ.get(_CG_ENV, "0") not in ("0", "", "false", "False")
-
-
-def _te_fused_cross_entropy(ctx: PatchContext) -> bool:
+def _cg_capturable_enabled(ctx: PatchContext) -> bool:
     args = get_args(ctx)
-    return bool(getattr(args, "cross_entropy_loss_fusion", False)) and (
-        getattr(args, "cross_entropy_fusion_impl", None) == "te"
+    return (
+        bool(getattr(args, "te_cross_entropy_cg_capturable", False))
+        and bool(getattr(args, "cross_entropy_loss_fusion", False))
+        and getattr(args, "cross_entropy_fusion_impl", None) == "te"
     )
 
 
@@ -129,15 +127,22 @@ def make_cg_capturable_cross_entropy(original):
     return te_parallel_cross_entropy
 
 
-def install_cg_capturable(te_ext, language_module) -> bool:
-    """Wrap the installed ``te_parallel_cross_entropy`` (Megatron's, or the overwrite_input one) in both modules."""
+def install_cg_capturable(te_ext, language_module) -> str:
+    """Wrap the installed ``te_parallel_cross_entropy`` (Megatron's, or the overwrite_input one) in both modules.
+
+    Returns ``"wrapped"``, ``"missing"`` (no TE cross entropy) or ``"deferred"``: the deferred cross entropy takes
+    its own path only for ``is_cg_capturable=False``, so it has to wrap this patch, not the other way round. The
+    priorities make it so; finding it already installed leaves it alone.
+    """
     current = getattr(language_module, "te_parallel_cross_entropy", None)
     if current is None:
-        return False
+        return "missing"
+    if getattr(current, "_primus_deferred_ce", False):
+        return "deferred"
     wrapped = make_cg_capturable_cross_entropy(current)
     te_ext.te_parallel_cross_entropy = wrapped
     language_module.te_parallel_cross_entropy = wrapped
-    return True
+    return "wrapped"
 
 
 @register_patch(
@@ -145,17 +150,22 @@ def install_cg_capturable(te_ext, language_module) -> bool:
     backend="megatron",
     phase="before_train",
     description="TE parallel_cross_entropy with is_cg_capturable=True: no blocking H2D / torch.equal in backward",
-    # after megatron.te.cross_entropy_overwrite_input (default priority 50), whose wrapper it wraps
-    priority=60,
-    condition=lambda ctx: cg_capturable_requested() and _te_fused_cross_entropy(ctx),
+    # After megatron.te.cross_entropy_overwrite_input (default priority 50), whose wrapper it wraps, and before
+    # megatron.te.cross_entropy_deferred (60), which wraps this one: the deferred path still sees the caller's
+    # is_cg_capturable, and only its TE fallback runs with True.
+    priority=55,
+    condition=_cg_capturable_enabled,
 )
 def patch_te_cross_entropy_cg_capturable(ctx: PatchContext) -> None:
     import megatron.core.extensions.transformer_engine as te_ext
     from megatron.core.models.common.language_module import language_module
 
-    if install_cg_capturable(te_ext, language_module):
+    outcome = install_cg_capturable(te_ext, language_module)
+    if outcome == "wrapped":
         log_rank_0(
             f"[Patch:{_CG_KEY}] TE cross entropy runs with is_cg_capturable=True (no host sync in backward)"
         )
+    elif outcome == "deferred":
+        log_rank_0(f"[Patch:{_CG_KEY}] the deferred cross entropy is already installed; left as it is")
     else:
         log_rank_0(f"[Patch:{_CG_KEY}] no TE cross entropy installed; nothing to wrap")
