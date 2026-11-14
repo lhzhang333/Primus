@@ -1,17 +1,20 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
 # See LICENSE for license information.
+###############################################################################
 
-"""CPU coverage of megatron.moe_alltoall_skip_idle_dtoh_sync: MoEAlltoAllTokenDispatcher's D2H event wait is
-skipped only for a dispatch whose D2H point copied nothing to the host -- on top of Megatron's own
-``_maybe_dtoh_and_synchronize`` and of the one Primus installs for PrimusTurbo grouped GEMM (tokens_per_expert
-kept on the device). Device tensors are stand-ins (``is_cuda``), streams and events are recorders (no GPU).
-"""
+"""megatron.moe_alltoall_skip_idle_dtoh_sync on CPU: MoEAlltoAllTokenDispatcher's D2H event wait is skipped only
+for a dispatch whose D2H point copied nothing to the host, on top of Megatron's own
+``_maybe_dtoh_and_synchronize`` and of the one Primus installs for PrimusTurbo grouped GEMM (tokens_per_expert kept
+on the device). Device tensors are stand-ins (``is_cuda``); streams and events are recorders."""
 
 import contextlib
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -46,7 +49,7 @@ class Dev:
 
 
 class Host:
-    """A host copy (CPU tensor / numpy) of a device tensor."""
+    """A host copy (CPU tensor) of a device tensor."""
 
     is_cuda = False
 
@@ -89,7 +92,7 @@ def cpu_cuda(monkeypatch):
 
 @pytest.fixture
 def primus_dtoh(monkeypatch):
-    """The method megatron.moe_alltoall_dtoh_turbo_grouped_gemm installs (the gate runs moe_patches' copy)."""
+    """The method megatron.moe_alltoall_dtoh_turbo_grouped_gemm installs (the run uses moe_patches' copy)."""
     mod = _load(
         "dtoh_turbo_under_test", "primus/backends/megatron/patches/moe_patches/moe_alltoall_dtoh_patches.py"
     )
@@ -111,6 +114,7 @@ def dispatcher(*, ep_tp=False, permute_fusion=True, dropping=False, drop_and_pad
     d.output_splits_tp = Dev("output_splits_tp") if ep_tp else None
     d.num_out_tokens = Dev("num_out_tokens") if dropping else 8192 * 8
     d.num_global_tokens_per_local_expert = Dev("ngtple")
+    d.routing_map = Dev("routing_map")  # device state the D2H point never copies
     # Megatron's preprocess: the earliest point that needs host values
     if dropping:
         d.cuda_sync_point = "before_permutation_1"
@@ -152,18 +156,18 @@ def state(d):
     return {a: _desc(getattr(d, a)) for a in STATE}
 
 
-def test_env_switch_default_off(monkeypatch):
-    monkeypatch.delenv("PRIMUS_MOE_SKIP_IDLE_DTOH_SYNC", raising=False)
-    assert not skip.requested()
-    for v in ("0", "", "false"):
-        monkeypatch.setenv("PRIMUS_MOE_SKIP_IDLE_DTOH_SYNC", v)
-        assert not skip.requested()
-    monkeypatch.setenv("PRIMUS_MOE_SKIP_IDLE_DTOH_SYNC", "1")
-    assert skip.requested()
+def _ctx(**args):
+    return SimpleNamespace(extra={"module_config": SimpleNamespace(params=SimpleNamespace(**args))})
+
+
+def test_yaml_flag_default_off():
+    assert skip._enabled(_ctx()) is False
+    assert skip._enabled(_ctx(moe_skip_idle_dtoh_sync=False)) is False
+    assert skip._enabled(_ctx(moe_skip_idle_dtoh_sync=True)) is True
 
 
 def test_ep1_turbo_grouped_gemm_skips_the_wait(primus_dtoh):
-    """The gate's case: EP = TP = 1, dropless, fused permute, tokens_per_expert on the device: no copies."""
+    """EP = TP = 1, dropless, fused permute, tokens_per_expert on the device: no copies, no wait."""
     base, wrapped = dispatcher(), dispatcher()
     tpe0, waits0 = run_dispatch(base, primus_dtoh)
     tpe1, waits1 = run_dispatch(wrapped, skip.wrap_maybe_dtoh_and_synchronize(primus_dtoh))
@@ -195,6 +199,50 @@ def test_host_copies_keep_the_wait(primus_dtoh, kw, point):
     assert _desc(tpe0) == _desc(tpe1)
     assert state(base) == state(wrapped)
     assert any(isinstance(v, tuple) and v[0] == "host" for v in state(wrapped).values())
+
+
+def _copying(attr, value_of):
+    """A D2H point that copies one more attribute than today's Megatron, then records the event."""
+
+    def method(self, point, tokens_per_expert=None):
+        if point == self.cuda_dtoh_point:
+            setattr(self, attr, value_of(self))
+            self.d2h_event = self.cuda_dtoh_stream.record_event()
+        if point == self.cuda_sync_point:
+            self.d2h_event.synchronize()
+        return tokens_per_expert
+
+    return method
+
+
+@pytest.mark.parametrize(
+    "attr,value_of",
+    [
+        ("routing_map", lambda d: Host(d.routing_map)),  # a device attribute replaced by its host copy
+        (
+            "expert_offsets_cpu",
+            lambda d: np.zeros(4, dtype=np.int64),
+        ),  # a new attribute holding a numpy array
+        ("splits_host", lambda d: torch.zeros(4)),  # a new attribute holding a CPU tensor
+    ],
+)
+def test_any_new_host_copy_keeps_the_wait(attr, value_of):
+    """Detection is over every dispatcher attribute, not a list of today's names."""
+    _, waits = run_dispatch(dispatcher(), skip.wrap_maybe_dtoh_and_synchronize(_copying(attr, value_of)))
+    assert waits == 1
+
+
+def test_copied_to_host_snapshot_rules():
+    dev, cpu = Dev("x"), torch.zeros(2)
+    assert not skip.copied_to_host(
+        {"a": dev, "e": object()}, {"a": dev, "e": object()}
+    )  # new non-data object
+    assert not skip.copied_to_host({"a": dev}, {"a": Dev("y")})  # device -> device
+    assert not skip.copied_to_host({"n": 3}, {"n": 3, "m": None})
+    assert skip.copied_to_host({"a": dev}, {"a": 7})  # device -> anything else
+    assert skip.copied_to_host({"a": None}, {"a": cpu})
+    assert skip.copied_to_host({}, {"a": np.arange(3)})
+    assert not skip.copied_to_host({"a": cpu}, {"a": cpu})  # unchanged host data
 
 
 def test_drop_and_pad_passes_through(primus_dtoh):

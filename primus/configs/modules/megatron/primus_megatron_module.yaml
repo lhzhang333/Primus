@@ -130,6 +130,13 @@ deferred_cross_entropy: false
 # PRIMUS_EMBEDDING_WGRAD_FUSION overrides.
 embedding_wgrad_fusion: false
 
+# ===== Host syncs =====
+# MoE all-to-all dispatcher: skip the D2H event wait of a dispatch whose D2H point
+# copied nothing to the host (EP = TP = 1, dropless, fused permute, and
+# tokens_per_expert kept on the device by use_turbo_grouped_gemm). Any host copy
+# keeps the wait. No numerical change.
+moe_skip_idle_dtoh_sync: false
+
 # ===== MXFP4 Weight De-oscillation =====
 # Snap weight elements whose MXFP4-quantized value oscillates while the fp32
 # master barely moves (improves MXFP4 training convergence). Requires
