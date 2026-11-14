@@ -60,6 +60,44 @@ def _turbo_mxfp8_state(monkeypatch):
     monkeypatch.setattr(ext, "get_num_microbatches", lambda: 2)  # the cached-weight + bridge path
 
 
+def test_consumer_memo_keys_on_the_recipe_value(monkeypatch):
+    """Primus' get_fp8_context builds a new quant config per layer forward: the consumer memo must hit on an equal
+    config, not grow by one entry (and one kept config) per forward."""
+    import contextlib
+
+    class Linear:
+        training, offload, te_quant_params = True, False, None
+
+    class Manager:
+        @staticmethod
+        def is_fp8_enabled():
+            return False
+
+        @staticmethod
+        def is_turbo_fp8_enabled():
+            return True
+
+        @staticmethod
+        def is_turbo_fp4_enabled():
+            return False
+
+        @staticmethod
+        def get_turbo_quant_config():  # a new object every call, as get_fp8_context makes it
+            return PrimusTurboQuantConfig(format=Format.E4M3, granularity=ScalingGranularity.MX_BLOCKWISE,
+                                          block_size=32, scale_dtype=ScaleDtype.E8M0)  # fmt: skip
+
+    asked = []
+    monkeypatch.setattr(ext, "PrimusTurboLinear", Linear)
+    monkeypatch.setattr(ext, "PrimusTurboLowPrecisionGlobalStateManager", Manager)
+    monkeypatch.setattr(ext, "_turbo_rmsnorm_mxfp8", lambda: object())
+    monkeypatch.setattr(ext, "_get_fp8_autocast_for_quant_params", lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(ext, "_in_mxfp8_linear_context", lambda: asked.append(1) or True)
+    linear = Linear()
+    for _ in range(100):
+        assert ext.can_consume_fused_mxfp8_activation(linear)
+    assert len(asked) == 1 and len(linear._primus_mxfp8_consumer_cache) == 1
+
+
 def test_pair_taken_once_per_reader():
     carrier, pair = torch.empty(2), object()
     attach_fused_mxfp8_activation(carrier, pair, 2)

@@ -337,21 +337,13 @@ def can_consume_fused_mxfp8_activation(module) -> bool:
     # Called from the producer, outside the module's forward: enter its quant context briefly (as the MXFP4
     # probe does) so the answer is this linear's recipe, not the surrounding state. Memoized per module and
     # autocast state (a linear's te_quant_params are fixed once built).
-    manager = PrimusTurboLowPrecisionGlobalStateManager
-    quant = manager.get_turbo_quant_config()
-    key = (
-        module.training,
-        manager.is_fp8_enabled(),
-        manager.is_turbo_fp8_enabled(),
-        manager.is_turbo_fp4_enabled(),
-        None if quant is None else id(quant),
-    )
+    key = _autocast_state_key(module)
     cache = module.__dict__.setdefault("_primus_mxfp8_consumer_cache", {})
     hit = cache.get(key)
     if hit is None:
         with _get_fp8_autocast_for_quant_params(module.te_quant_params, module.training):
-            hit = cache[key] = (quant, _in_mxfp8_linear_context())  # (keeps ``quant`` alive: its id is in the key)
-    return hit[1]
+            hit = cache[key] = _in_mxfp8_linear_context()
+    return hit
 
 
 def _turbo_mxfp8_quant(linear):
