@@ -1,11 +1,13 @@
+###############################################################################
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Licensed under the Apache License, Version 2.0.
+#
+# See LICENSE for license information.
+###############################################################################
 
 """The embedding-wgrad-into-main_grad patch (``embedding_wgrad_fusion_patches``): when it applies (CPU), and on GPU
-the fused backward against today's path (dense ``embedding_dense_backward`` gradient + Megatron's
+the fused backward against the unfused one (dense ``embedding_dense_backward`` gradient + Megatron's
 ``main_grad.add_``): bitwise equal (bf16 and fp32 main_grad, mock-like and heavily repeated ids, small tables with
-tails), forward bitwise, deterministic, the dummy taken from the shared pool without growing it. Also prints how
-far today's (and so the fused) result is from one rounding of the exact sum."""
+column tails), forward bitwise, deterministic, the weight's gradient the pooled dummy."""
 
 from types import SimpleNamespace
 
@@ -18,15 +20,16 @@ import primus.backends.megatron.patches.embedding_wgrad_fusion_patches as patch
 # ------------------------------------------------------------------------------------------------- selection (CPU)
 
 
+def _ctx(**args):
+    return SimpleNamespace(extra={"module_config": SimpleNamespace(params=SimpleNamespace(**args))})
+
+
 @pytest.mark.parametrize(
-    "env, arg, want", [(None, False, False), (None, True, True), ("1", False, True), ("0", True, False)]
+    "args, want",
+    [({}, False), (dict(embedding_wgrad_fusion=False), False), (dict(embedding_wgrad_fusion=True), True)],
 )
-def test_switch(monkeypatch, env, arg, want):
-    if env is None:
-        monkeypatch.delenv("PRIMUS_EMBEDDING_WGRAD_FUSION", raising=False)
-    else:
-        monkeypatch.setenv("PRIMUS_EMBEDDING_WGRAD_FUSION", env)
-    assert patch._requested(SimpleNamespace(embedding_wgrad_fusion=arg)) is want
+def test_yaml_flag(args, want):
+    assert patch._patch_condition(_ctx(**args)) is want
 
 
 def _emb(device="cpu", main_grad_dtype=torch.float32, **kw):
@@ -35,8 +38,15 @@ def _emb(device="cpu", main_grad_dtype=torch.float32, **kw):
     w.grad_added_to_main_grad = False
     for k in [k for k in kw if k.startswith("w_")]:
         setattr(w, k[2:], kw.pop(k))
-    base = dict(weight=w, training=True, tp_group=SimpleNamespace(size=lambda: 1), gtp_remat_size=1,
-                reduce_scatter_embeddings=False, config=SimpleNamespace(gradient_accumulation_fusion=True))  # fmt: skip
+    base = dict(
+        weight=w,
+        training=True,
+        deterministic_mode=False,
+        tp_group=SimpleNamespace(size=lambda: 1),
+        gtp_remat_size=1,
+        reduce_scatter_embeddings=False,
+        config=SimpleNamespace(gradient_accumulation_fusion=True),
+    )
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -51,6 +61,7 @@ def test_fusable_in_the_supported_case():
     "kw",
     [
         dict(training=False),
+        dict(deterministic_mode=True),  # Megatron embeds with weight[ids] there
         dict(tp_group=SimpleNamespace(size=lambda: 2)),
         dict(gtp_remat_size=2),
         dict(reduce_scatter_embeddings=True),
@@ -62,13 +73,16 @@ def test_not_fusable(kw):
     assert not patch._fusable(_emb(**kw), IDS)
 
 
-def test_not_fusable_without_main_grad_or_long_ids():
+def test_not_fusable_without_main_grad_long_ids_or_deterministic_mode_attribute():
     emb = _emb()
     del emb.weight.main_grad
     assert not patch._fusable(emb, IDS)
     assert not patch._fusable(_emb(), IDS.int())
     with torch.no_grad():
         assert not patch._fusable(_emb(), IDS)
+    emb = _emb()
+    del emb.deterministic_mode  # fails closed
+    assert not patch._fusable(emb, IDS)
 
 
 def test_install_routes_and_falls_back(monkeypatch):
@@ -103,7 +117,7 @@ def test_accumulate_rows_is_dense_backward_plus_add(V_, H_, T_, main_grad_dtype)
     assert torch.equal(patch.accumulate_rows_(main.clone(), ids, rows), want)
 
 
-V, H, B, S = 129408, 7168, 2, 4096  # DeepSeek-V3 (padded vocabulary), T = 8192 tokens
+V, H, B, S = 129408, 7168, 2, 4096  # a large vocabulary and hidden size, T = 8192 tokens
 
 
 def _ids(kind, seed):
@@ -114,19 +128,8 @@ def _ids(kind, seed):
     return hot[torch.randint(0, 97, (B, S), device="cuda", generator=g)]
 
 
-def _ordered(t):
-    """bf16 / fp32 bits as integers ordered like the values (for ulp distances across the sign)."""
-    i = t.view(torch.int16 if t.dtype == torch.bfloat16 else torch.int32).long()
-    sign = torch.iinfo(torch.int16 if t.dtype == torch.bfloat16 else torch.int32).min
-    return torch.where(i < 0, sign - i, i)
-
-
-def _ulp(a, b):
-    return (_ordered(a) - _ordered(b)).abs()
-
-
 def _setup(kind, main_grad_dtype, seed=0):
-    """(weight, main_grad before, ids, grad_out) of a micro-batch at the DeepSeek-V3 shape."""
+    """(weight, main_grad before, ids, grad_out) of one micro-batch."""
     g = torch.Generator(device="cuda").manual_seed(seed + 1)
     weight = (torch.randn(V, H, device="cuda", generator=g) * 0.02).bfloat16()
     main0 = (torch.randn(V, H, device="cuda", generator=g) * 1e-3).to(main_grad_dtype)
@@ -143,7 +146,7 @@ def _fused(weight, main0, ids, grad):
     return w.main_grad, out.detach(), w
 
 
-def _today(weight, main0, ids, grad):
+def _unfused(weight, main0, ids, grad):
     """(main_grad, forward output): F.embedding's dense gradient, then Megatron's grad hook main_grad.add_(grad)."""
     w = torch.nn.Parameter(weight.clone())
     out = F.embedding(ids, w)
@@ -154,53 +157,46 @@ def _today(weight, main0, ids, grad):
 @gpu
 @pytest.mark.parametrize("main_grad_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("kind", ["random", "hot"])
-def test_against_exact_sum_and_todays_path(kind, main_grad_dtype):
+def test_fused_is_bitwise_the_unfused_path(kind, main_grad_dtype):
     weight, main0, ids, grad = _setup(kind, main_grad_dtype)
     fused, out_f, w = _fused(weight, main0, ids, grad)
-    today, out_t = _today(weight, main0, ids, grad)
-    assert torch.equal(out_f, out_t), "the forward must be F.embedding's"
+    unfused, out_u = _unfused(weight, main0, ids, grad)
+    assert torch.equal(out_f, out_u), "the forward must be F.embedding's"
     assert w.grad_added_to_main_grad and w.grad.shape == w.shape
-    uniq, inv = torch.unique(ids, return_inverse=True)
-    rows = torch.zeros(uniq.numel(), H, device="cuda", dtype=torch.float64)
-    rows.index_add_(0, inv.flatten(), grad.reshape(-1, H).double())
-    exact = (main0[uniq].double() + rows).to(main_grad_dtype)  # one rounding of the exact sum
     untouched = torch.ones(V, dtype=torch.bool, device="cuda")
-    untouched[uniq] = False
-    assert torch.equal(fused[untouched], main0[untouched]) and torch.equal(today[untouched], main0[untouched])
-    uf, ut, ftd = _ulp(fused[uniq], exact), _ulp(today[uniq], exact), _ulp(fused[uniq], today[uniq])
-    print(f"\nEMB {kind:6} {str(main_grad_dtype):14}: fused vs one-rounded exact: max {uf.max().item()} ulp, "
-          f"{(uf != 0).float().mean().item():.2e} differ; today vs exact: max {ut.max().item()} ulp, "
-          f"{(ut != 0).float().mean().item():.2e} differ; fused vs today: max {ftd.max().item()} ulp, "
-          f"{(ftd != 0).float().mean().item():.2e} differ")  # fmt: skip
-    assert torch.equal(fused, today), "the fused backward must be bitwise today's main_grad"
+    untouched[torch.unique(ids)] = False
+    assert torch.equal(fused[untouched], main0[untouched])
+    assert torch.equal(fused, unfused), "the fused backward must be bitwise the unfused main_grad"
 
 
 @gpu
 def test_deterministic():
-    """Repeated runs are bitwise identical (cross-process: scratch w_emb.py); under torch's deterministic-algorithms
-    mode the patch stands down (Megatron's deterministic_mode embeds with weight[ids])."""
+    """Repeated runs are bitwise identical."""
     case = _setup("hot", torch.bfloat16, seed=5)
     ref = _fused(*case)[0]
     assert torch.equal(_fused(*case)[0], ref)
-    prev = torch.are_deterministic_algorithms_enabled()
-    torch.use_deterministic_algorithms(True)
-    try:
-        assert not patch._fusable(_emb(device="cuda"), IDS.cuda())
-    finally:
-        torch.use_deterministic_algorithms(prev)
 
 
 @gpu
-def test_dummy_from_the_shared_pool_without_growing_it():
-    pytest.importorskip("primus_turbo")
-    from primus_turbo.pytorch.ops import utils as turbo_utils
+def test_weight_grad_is_the_pooled_dummy():
+    """The weight's .grad is the dummy the dummy-wgrad helper hands out for its shape (not a copy), whatever the
+    installed pool looks like."""
+    w = _fused(*_setup("random", torch.bfloat16))[-1]
+    assert w.grad.data_ptr() == patch._dummy_wgrad(w.shape, w.dtype).data_ptr()
 
-    turbo_utils._get_dummy_wgrad(
-        [V + 1024, H], torch.bfloat16
-    )  # an expert stack's dummy, larger than the table
-    pool = turbo_utils._dummy_wgrads[(torch.bfloat16, torch.cuda.current_device())]
+
+@gpu
+def test_flat_dummy_pool_does_not_grow():
+    """With a Primus-Turbo whose dummy-wgrad pool is one flat buffer per (dtype, device), the embedding's dummy is
+    a view of it: the buffer neither grows nor moves."""
+    turbo_utils = pytest.importorskip("primus_turbo.pytorch.ops.utils")
+    turbo_utils._get_dummy_wgrad([V + 1024, H], torch.bfloat16)  # a dummy larger than the table
+    key = (torch.bfloat16, torch.cuda.current_device())
+    pool = getattr(turbo_utils, "_dummy_wgrads", {}).get(key)
+    if pool is None:
+        pytest.skip("this Primus-Turbo keeps one dummy per shape")
     numel, ptr = pool.numel(), pool.data_ptr()
     w = _fused(*_setup("random", torch.bfloat16))[-1]
-    pool = turbo_utils._dummy_wgrads[(torch.bfloat16, torch.cuda.current_device())]
+    pool = turbo_utils._dummy_wgrads[key]
     assert pool.numel() == numel and pool.data_ptr() == ptr, "the pool grew"
-    assert w.grad.data_ptr() == ptr, "the weight's .grad is not the pooled dummy (copied?)"
+    assert w.grad.data_ptr() == ptr

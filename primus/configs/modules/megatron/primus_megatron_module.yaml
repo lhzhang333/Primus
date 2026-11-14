@@ -128,12 +128,12 @@ deferred_cross_entropy: false
 # path hands back to TE get the flag.
 te_cross_entropy_cg_capturable: false
 
-# Embedding wgrad straight into main_grad: the token rows are added into the
-# word embedding's main_grad (sorted, deterministic index_put_ accumulate) instead
-# of a dense table-sized gradient being zero-filled every micro-batch and then
-# added in full (DeepSeek-V3: 1.73 GiB). TP=1, gradient_accumulation_fusion, not
-# for a weight with zero_out_wgrad (tied output layer / MTP). Env
-# PRIMUS_EMBEDDING_WGRAD_FUSION overrides.
+# Embedding wgrad straight into main_grad: each touched row's token sum (the dense
+# gradient's per-row sums, from a stable sort of the ids) is added into the word
+# embedding's main_grad, instead of a dense table-sized gradient being zero-filled
+# every micro-batch and then added in full. Bitwise the unfused result. TP=1,
+# gradient_accumulation_fusion, not in deterministic_mode, not for a weight with
+# zero_out_wgrad (tied output layer / MTP).
 embedding_wgrad_fusion: false
 
 # ===== Host syncs =====
