@@ -104,9 +104,6 @@ turbo_mega_moe_precision: bf16
 # DDP: off under Megatron-FSDP). null follows gradient_accumulation_fusion; true / false set it for
 # the MegaMoE experts alone.
 turbo_mega_moe_wgrad_accum_fusion: null
-# MegaMoE at EP1 too: tests and bring-up only (one GPU has nothing to send, so the fused op only adds its
-# protocol's cost there). Off: MegaMoE patches in for 1 < EP <= 8 only.
-turbo_mega_moe_allow_ep1: false
 
 # ===== Layer Norm =====
 # operator switch

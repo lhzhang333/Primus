@@ -1,9 +1,9 @@
 # Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # See LICENSE for license information.
 
-"""MegaMoE's mxfp8 experts without a GPU: the test-only EP1 override of the patch, the activation both expert
-flavours hand their kernels (one rule for every arch and precision), and the wgrad accumulation pattern the
-mxfp8 stages take. The Turbo ops are stubbed; ``GLUActivation`` is Turbo's own class. Collects on a GPU-less host:
+"""MegaMoE's mxfp8 experts without a GPU: the EP range the patch takes, the activation both expert flavours
+hand their kernels (one rule for every arch and precision), and the wgrad accumulation pattern the mxfp8 stages
+take. The Turbo ops are stubbed; ``GLUActivation`` is Turbo's own class. Collects on a GPU-less host:
 nothing here imports ``megatron.training`` (its import pulls in aiter, which probes the GPU)."""
 
 import importlib.util
@@ -97,17 +97,13 @@ def _experts(mega_moe, cls, config):
     return getattr(mega_moe, cls)(config, 4, config.hidden_size, config.moe_ffn_hidden_size, _EPGroup())
 
 
-@pytest.mark.parametrize(
-    "ep, allow, want",
-    [(1, None, False), (1, False, False), (1, True, True), (2, False, True), (8, True, True), (16, True, False)],
-)
-def test_ep1_needs_the_test_override(monkeypatch, ep, allow, want):
+@pytest.mark.parametrize("ep, want", [(1, False), (2, True), (8, True), (16, False)])
+def test_mega_moe_patches_in_for_an_intra_node_ep_group(monkeypatch, ep, want):
+    """The fused all-to-all rides intra-node peer transfers: MegaMoE patches in for 1 < EP <= 8 only."""
     from primus.backends.megatron.patches.turbo import mega_moe_patches as P
 
     monkeypatch.setattr(P, "is_primus_turbo_can_patch", lambda ctx: True)
     params = dict(use_turbo_mega_moe=True, bf16=True, expert_model_parallel_size=ep)
-    if allow is not None:
-        params["turbo_mega_moe_allow_ep1"] = allow
     ctx = PatchContext(backend="megatron", phase="before_train",
                        extra={"module_config": SimpleNamespace(params=SimpleNamespace(**params))})  # fmt: skip
     assert P._is_turbo_mega_moe_can_patch(ctx) is want
