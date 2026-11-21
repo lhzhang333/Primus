@@ -392,6 +392,55 @@ test_mi350x_env_file() {
 }
 
 # ============================================================================
+# Test 11b: MI455X GPU env file
+# ============================================================================
+test_mi455x_env_file() {
+    echo "Test 11b: MI455X GPU env file"
+
+    result=$(bash -c "
+        unset TRITON_HIP_USE_EXPERT_SCHEDULING HSA_COREDUMP_PATTERN
+        export MASTER_ADDR=localhost MASTER_PORT=1234 NNODES=1 NODE_RANK=0 GPUS_PER_NODE=1
+        export PRIMUS_SKIP_VALIDATION=1
+        export PRIMUS_GPU_MODEL=MI455X
+        source '$PROJECT_ROOT/runner/helpers/envs/primus-env.sh' >/dev/null
+        [[ \"\$TRITON_HIP_USE_EXPERT_SCHEDULING\" == 0 && \"\$HSA_COREDUMP_PATTERN\" == /dev/null ]] && echo PASS || echo FAIL
+    " 2>/dev/null)
+    if echo "$result" | grep -q PASS; then
+        assert_pass "MI455X.sh turns Triton expert scheduling and GPU core files off"
+    else
+        assert_fail "MI455X.sh turns Triton expert scheduling and GPU core files off"
+    fi
+
+    result=$(bash -c "
+        export TRITON_HIP_USE_EXPERT_SCHEDULING=1 HSA_COREDUMP_PATTERN=core.%p
+        export MASTER_ADDR=localhost MASTER_PORT=1234 NNODES=1 NODE_RANK=0 GPUS_PER_NODE=1
+        export PRIMUS_SKIP_VALIDATION=1
+        export PRIMUS_GPU_MODEL=MI455X
+        source '$PROJECT_ROOT/runner/helpers/envs/primus-env.sh' >/dev/null
+        [[ \"\$TRITON_HIP_USE_EXPERT_SCHEDULING\" == 1 && \"\$HSA_COREDUMP_PATTERN\" == core.%p ]] && echo PASS || echo FAIL
+    " 2>/dev/null)
+    if echo "$result" | grep -q PASS; then
+        assert_pass "MI455X.sh keeps the caller's values of both"
+    else
+        assert_fail "MI455X.sh keeps the caller's values of both"
+    fi
+
+    result=$(bash -c "
+        unset TRITON_HIP_USE_EXPERT_SCHEDULING HSA_COREDUMP_PATTERN
+        export MASTER_ADDR=localhost MASTER_PORT=1234 NNODES=1 NODE_RANK=0 GPUS_PER_NODE=8
+        export PRIMUS_SKIP_VALIDATION=1
+        export PRIMUS_GPU_MODEL=MI355X
+        source '$PROJECT_ROOT/runner/helpers/envs/primus-env.sh' >/dev/null
+        [[ -z \"\${TRITON_HIP_USE_EXPERT_SCHEDULING+x}\${HSA_COREDUMP_PATTERN+x}\" ]] && echo PASS || echo FAIL
+    " 2>/dev/null)
+    if echo "$result" | grep -q PASS; then
+        assert_pass "Other GPU models do not get the MI455X defaults"
+    else
+        assert_fail "Other GPU models do not get the MI455X defaults"
+    fi
+}
+
+# ============================================================================
 # Test 12: HIP_VISIBLE_DEVICES selection is preserved
 # ============================================================================
 test_hip_visible_devices() {
@@ -443,6 +492,7 @@ test_loading_order
 test_missing_base_env
 test_env_defaults
 test_mi350x_env_file
+test_mi455x_env_file
 test_hip_visible_devices
 
 echo ""

@@ -49,16 +49,14 @@ if [ "${PRIMUS_LAUNCHER}" = "container" ]; then
 fi
 
 ########################## gfx1250 runtime settings ##########################
-# Selects runner/helpers/envs/MI455X.sh; Primus also maps gfx1250 to MI455X on its own.
+# Selects runner/helpers/envs/MI455X.sh; Primus also maps gfx1250 to MI455X on its own. That file
+# defaults TRITON_HIP_USE_EXPERT_SCHEDULING=0 (Triton 3.8 enables amdgpu-expert-scheduling-mode for
+# gfx1250, which causes random memory faults / NaN in Turbo Triton kernels) and
+# HSA_COREDUMP_PATTERN=/dev/null. The env var alone misses Inductor kernels loaded from an earlier
+# run's cache, so Triton's default is also patched below (PATCH_TRITON_EXPERT_SCHEDULING=0 to skip).
 export PRIMUS_GPU_MODEL=${PRIMUS_GPU_MODEL:-MI455X}
-# Triton 3.8 enables amdgpu-expert-scheduling-mode for gfx1250 by default, which causes random
-# memory faults / NaN in Turbo Triton kernels. The env var alone misses Inductor kernels loaded from
-# an earlier run's cache, so Triton's default is also patched below (PATCH_TRITON_EXPERT_SCHEDULING=0 to skip).
-export TRITON_HIP_USE_EXPERT_SCHEDULING=${TRITON_HIP_USE_EXPERT_SCHEDULING:-0}
 # Turbo Triton attention, which the baseline in README.md uses.
 export PRIMUS_TURBO_ATTN_BACKEND=${PRIMUS_TURBO_ATTN_BACKEND:-triton}
-# A GPU fault otherwise writes a multi-GB core file per rank into the working directory.
-export HSA_COREDUMP_PATTERN=${HSA_COREDUMP_PATTERN:-/dev/null}
 # hipBLASLt GEMM tuning for the hipBLASLt build in DOCKER_IMAGE (README.md, "GEMM tuning").
 # Set HIPBLASLT_TUNING_OVERRIDE_FILE= (empty) for hipBLASLt's default kernel selection.
 export HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE-${HERE}/hipblaslt_tuning/gpt_oss-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt}

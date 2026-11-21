@@ -16,6 +16,15 @@ _PRIMUS_WORLD_SIZE=$(( ${GPUS_PER_NODE:-1} * ${NNODES:-1} ))
 # 3 is a V4-Pro workaround that no longer reproduces here and costs 38% on Pro itself.
 export AMD_SERIALIZE_COPY=${AMD_SERIALIZE_COPY:-0}
 
+# Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes Triton kernels fault or
+# return NaN at random. 0 turns it off for every kernel Triton compiles. Kernels Inductor loads
+# from its own cache are not recompiled: runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh
+# changes Triton's default as well.
+export TRITON_HIP_USE_EXPERT_SCHEDULING=${TRITON_HIP_USE_EXPERT_SCHEDULING:-0}
+
+# A GPU fault otherwise writes a multi-GB core file per rank into the working directory.
+export HSA_COREDUMP_PATTERN=${HSA_COREDUMP_PATTERN:-/dev/null}
+
 # Cards in a node are XGMI 1-hop, so P2P is the right transport above one rank.
 if [[ -z "${NCCL_P2P_DISABLE:-}" ]]; then
     if [[ "${_PRIMUS_WORLD_SIZE}" -gt 1 ]]; then
