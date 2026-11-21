@@ -75,6 +75,7 @@ export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}
 # 4 hardware queues per process, not base_env.sh's 2 (a little faster)
 export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-4}
 # 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
+# (runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh)
 export PATCH_TRITON_EXPERT_SCHEDULING=${PATCH_TRITON_EXPERT_SCHEDULING:-1}
 # hipBLASLt kernels tuned for this example's GEMMs (README.md); empty: hipBLASLt's own choice. hipBLASLt
 # uses a row only while its solution index still names the kernel it was tuned with. No default with
@@ -136,19 +137,8 @@ esac
 # return NaN at random. TRITON_HIP_USE_EXPERT_SCHEDULING=0 (runner/helpers/envs/MI455X.sh, unless
 # the caller set it) turns it off when a kernel is compiled, but Inductor loads kernels from its
 # own cache without compiling them; changing Triton's default also invalidates that cache.
-if [[ "${PATCH_TRITON_EXPERT_SCHEDULING}" == 1 ]]; then
-    TRITON_AMD_COMPILER=$(python3 -c 'import os, triton; print(os.path.join(os.path.dirname(triton.__file__), "backends", "amd", "compiler.py"))')
-    if ! grep -q '^def is_expert_scheduling_enabled(arch):' "${TRITON_AMD_COMPILER}"; then
-        echo "no is_expert_scheduling_enabled(arch) in ${TRITON_AMD_COMPILER}; Triton not patched" >&2
-    elif ! grep -A1 '^def is_expert_scheduling_enabled(arch):' "${TRITON_AMD_COMPILER}" | grep -q '^    return False$'; then
-        if [[ ! -w "$(dirname "${TRITON_AMD_COMPILER}")" ]]; then
-            echo "cannot patch ${TRITON_AMD_COMPILER} as uid $(id -u); run as root or set PATCH_TRITON_EXPERT_SCHEDULING=0" >&2
-            exit 2
-        fi
-        sed -i '/^def is_expert_scheduling_enabled(arch):/a\    return False' "${TRITON_AMD_COMPILER}"
-        echo "patched ${TRITON_AMD_COMPILER}: is_expert_scheduling_enabled() -> False"
-    fi
-fi
+# The patch script exits 2 when there is nothing to do and 1 when it cannot patch.
+bash runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh || [[ $? == 2 ]] || exit 2
 
 # True / False: whether the Primus-Turbo this run imports (TURBO_DIR, when set, else the image's) has
 # a feature; --where: its package directory
