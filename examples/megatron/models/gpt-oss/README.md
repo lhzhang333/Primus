@@ -262,7 +262,7 @@ python examples/megatron/guides/offline_tune/offline_tune_gemm.py \
 
 The image ships ROCm as TheRock Python wheels, without `/opt/rocm` and without `hipblaslt-bench`,
 which `offline_tune_gemm.py` runs as `/opt/rocm/bin/hipblaslt-bench`.
-`hipblaslt_tuning/hipblaslt_bench/CMakeLists.txt` builds only the bench, from the hipBLASLt sources
+`examples/megatron/guides/offline_tune/hipblaslt_bench/CMakeLists.txt` builds only the bench, from the hipBLASLt sources
 of the image's TheRock build and against the image's installed hipBLASLt, so the bench reports the
 solution indices that training uses. Inside the container, from the repository root (about
 1.5 minutes: 1 to fetch, the rest to build):
@@ -278,7 +278,7 @@ git init -q "$SRC"
 git -C "$SRC" sparse-checkout set projects/hipblaslt
 git -C "$SRC" fetch --depth 1 --filter=blob:none https://github.com/ROCm/rocm-libraries.git "$SHA"
 git -C "$SRC" checkout -q FETCH_HEAD
-cmake -G Ninja -S examples/megatron/models/gpt-oss/hipblaslt_tuning/hipblaslt_bench -B "$B" \
+cmake -G Ninja -S examples/megatron/guides/offline_tune/hipblaslt_bench -B "$B" \
   -DHIPBLASLT_SRC="$SRC/projects/hipblaslt" -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=gfx1250 \
   -DCMAKE_PREFIX_PATH="$D;$D/lib/cmake" -DCMAKE_CXX_COMPILER="$D/lib/llvm/bin/amdclang++" \
   -DCMAKE_Fortran_COMPILER=gfortran -DCMAKE_SKIP_BUILD_RPATH=ON
