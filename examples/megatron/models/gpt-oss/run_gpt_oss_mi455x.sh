@@ -62,14 +62,8 @@ export PRIMUS_TURBO_ATTN_BACKEND=${PRIMUS_TURBO_ATTN_BACKEND:-triton}
 export HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE-${HERE}/hipblaslt_tuning/gpt_oss-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt}
 [ -n "${HIPBLASLT_TUNING_OVERRIDE_FILE}" ] || unset HIPBLASLT_TUNING_OVERRIDE_FILE
 
-if [ "${PATCH_TRITON_EXPERT_SCHEDULING:-1}" = "1" ]; then
-  TRITON_AMD_COMPILER="$(python -c 'import os, triton; print(os.path.join(os.path.dirname(triton.__file__), "backends", "amd", "compiler.py"))')"
-  if grep -q '^def is_expert_scheduling_enabled(arch):' "${TRITON_AMD_COMPILER}" &&
-     ! grep -A1 '^def is_expert_scheduling_enabled(arch):' "${TRITON_AMD_COMPILER}" | grep -q '^    return False$'; then
-    sed -i '/^def is_expert_scheduling_enabled(arch):/a\    return False' "${TRITON_AMD_COMPILER}"
-    echo "[gpt-oss] patched ${TRITON_AMD_COMPILER}: is_expert_scheduling_enabled() -> False"
-  fi
-fi
+# The patch script exits 2 when there is nothing to do and 1 when it cannot patch (not root).
+bash runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh || [[ $? == 2 ]] || exit 2
 
 ################################ Parallelism #################################
 export NNODES=1
