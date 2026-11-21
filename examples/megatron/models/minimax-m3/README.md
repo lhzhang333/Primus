@@ -177,9 +177,9 @@ Primus's average over iterations 3–10 (`log_avg_skip_iterations=2`). Memory is
 enabled`: when its HIP extension does not build, Primus logs the error and trains without it.
 
 **Triton expert scheduling.** Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes
-Triton kernels fault or return NaN at random. The launcher sets `TRITON_HIP_USE_EXPERT_SCHEDULING=0`,
-which Triton applies whenever it compiles a kernel, and with `PATCH_TRITON_EXPERT_SCHEDULING=1` (the
-default) also makes `is_expert_scheduling_enabled()` in the container's Triton return `False`, which
+Triton kernels fault or return NaN at random. MI455X runs default to `TRITON_HIP_USE_EXPERT_SCHEDULING=0`
+(`runner/helpers/envs/MI455X.sh`; a value the caller exports wins), which Triton applies whenever it
+compiles a kernel, and with `PATCH_TRITON_EXPERT_SCHEDULING=1` (the default) the launcher also makes `is_expert_scheduling_enabled()` in the container's Triton return `False`, which
 invalidates Inductor's cache of kernels compiled without the variable. The patch needs root and stays
 in a long-lived container; set `PATCH_TRITON_EXPERT_SCHEDULING=0` to skip it. See the Llama-3.1-8B
 README for the same note.

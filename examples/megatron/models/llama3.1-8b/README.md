@@ -71,9 +71,9 @@ container it runs as the container's user, which has to be root for the Triton p
 
 **Triton expert scheduling.** Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes
 Triton kernels (here the Inductor-compiled SwiGLU, and Primus-Turbo's Triton attention) fault or return
-NaN at random. The launcher sets
-`TRITON_HIP_USE_EXPERT_SCHEDULING=0`, which Triton applies whenever it compiles a kernel, and with
-`PATCH_TRITON_EXPERT_SCHEDULING=1` (the default) also makes `is_expert_scheduling_enabled()` in the
+NaN at random. MI455X runs default to `TRITON_HIP_USE_EXPERT_SCHEDULING=0`
+(`runner/helpers/envs/MI455X.sh`; a value the caller exports wins), which Triton applies whenever it
+compiles a kernel, and with `PATCH_TRITON_EXPERT_SCHEDULING=1` (the default) the launcher also makes `is_expert_scheduling_enabled()` in the
 container's Triton return `False`, which invalidates Inductor's cache of kernels compiled without the
 variable. The patch needs root and stays in a long-lived container; set
 `PATCH_TRITON_EXPERT_SCHEDULING=0` to skip it.

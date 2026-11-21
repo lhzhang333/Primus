@@ -88,8 +88,9 @@ training runs as root in the new container, so the files it creates are owned by
 container it runs as the container's user, which has to be root for the Triton patch.
 
 **Triton expert scheduling.** Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes
-Triton kernels fault or return NaN at random. The launcher sets `TRITON_HIP_USE_EXPERT_SCHEDULING=0`,
-which Triton applies whenever it compiles a kernel. Inductor, however, also loads kernels from its own
+Triton kernels fault or return NaN at random. MI455X runs default to `TRITON_HIP_USE_EXPERT_SCHEDULING=0`
+(`runner/helpers/envs/MI455X.sh`; a value the caller exports wins), which Triton applies whenever it
+compiles a kernel. Inductor, however, also loads kernels from its own
 cache without compiling them, so a container that ran without the variable can keep expert-mode kernels.
 With `PATCH_TRITON_EXPERT_SCHEDULING=1` (the default) the launcher therefore also makes
 `is_expert_scheduling_enabled()` in the container's Triton return `False`, like the GPT-OSS example; that

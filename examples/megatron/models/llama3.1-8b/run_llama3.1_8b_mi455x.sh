@@ -136,9 +136,9 @@ if [[ "${USE_TURBO_ATTENTION,,}" =~ ^(true|1|yes)$ && "${PRIMUS_TURBO_ATTN_BACKE
 fi
 
 # Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes Triton kernels fault or
-# return NaN at random. TRITON_HIP_USE_EXPERT_SCHEDULING=0 (below) turns it off when a kernel is
-# compiled, but Inductor loads kernels from its own cache without compiling them; changing Triton's
-# default also invalidates that cache.
+# return NaN at random. TRITON_HIP_USE_EXPERT_SCHEDULING=0 (runner/helpers/envs/MI455X.sh, unless
+# the caller set it) turns it off when a kernel is compiled, but Inductor loads kernels from its
+# own cache without compiling them; changing Triton's default also invalidates that cache.
 if [[ "${PATCH_TRITON_EXPERT_SCHEDULING}" == 1 ]]; then
     TRITON_AMD_COMPILER=$(python3 -c 'import os, triton; print(os.path.join(os.path.dirname(triton.__file__), "backends", "amd", "compiler.py"))')
     if ! grep -q '^def is_expert_scheduling_enabled(arch):' "${TRITON_AMD_COMPILER}"; then
@@ -163,9 +163,7 @@ ENV_ARGS=(
     --env NNODES=1
     --env GPUS_PER_NODE="${GPUS_PER_NODE}"
     --env HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
-    --env TRITON_HIP_USE_EXPERT_SCHEDULING=0
     --env PRIMUS_TURBO_ATTN_BACKEND="${PRIMUS_TURBO_ATTN_BACKEND}"
-    --env HSA_COREDUMP_PATTERN=/dev/null
 )
 if [[ -n "${TURBO_DIR}" ]]; then
     # --env is applied after Primus builds PYTHONPATH, so this checkout comes first.
