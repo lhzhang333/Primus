@@ -4,7 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +35,40 @@ def test_local_experts():
     assert patch.local_experts(SimpleNamespace(num_experts=None, expert_model_parallel_size=1)) == 0
 
 
+def _run_patch(monkeypatch, backend, num_experts=128, gfx1250=True):
+    """The patch body against a stand-in for Primus-Turbo's backend class."""
+    impl = ModuleType("primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl")
+    impl.GroupedGEMMVariableKFlyDSLBackend = backend
+    grouped_gemm = ModuleType("primus_turbo.pytorch.kernels.grouped_gemm")
+    grouped_gemm.grouped_gemm_impl = impl
+    utils = ModuleType("primus_turbo.pytorch.core.utils")
+    utils.is_gfx1250 = lambda: gfx1250
+    for name, module in (
+        ("primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_impl", impl),
+        ("primus_turbo.pytorch.kernels.grouped_gemm", grouped_gemm),
+        ("primus_turbo.pytorch.core.utils", utils),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    args = SimpleNamespace(num_experts=num_experts, expert_model_parallel_size=1)
+    monkeypatch.setattr(patch, "get_args", lambda ctx: args)
+    patch.patch_flydsl_grouped_gemm_max_groups(None)
+
+
+def test_patch_raises_the_cap_of_a_turbo_without_a_gfx1250_cap(monkeypatch):
+    backend = type("Backend", (), {"MAX_G": 64})
+    _run_patch(monkeypatch, backend)
+    assert backend.MAX_G == 128
+    backend = type("Backend", (), {"MAX_G": 64})
+    _run_patch(monkeypatch, backend, gfx1250=False)
+    assert backend.MAX_G == 64
+
+
+def test_patch_leaves_a_turbo_with_its_own_gfx1250_cap_alone(monkeypatch):
+    backend = type("Backend", (), {"MAX_G": 64, "MAX_G_GFX1250": 160})
+    _run_patch(monkeypatch, backend)
+    assert (backend.MAX_G, backend.MAX_G_GFX1250) == (64, 160)
+
+
 def test_flydsl_grouped_gemm_over_64_experts(monkeypatch):
     turbo = pytest.importorskip("primus_turbo.pytorch")
     from primus_turbo.pytorch.core.utils import is_gfx1250
@@ -44,7 +79,8 @@ def test_flydsl_grouped_gemm_over_64_experts(monkeypatch):
     # Primus-Turbo 4c74631's gfx1250 forward rejects groups that average 64 rows or fewer
     G, rows, K, N = 128, 128, 1024, 1024
     backend = grouped_gemm_impl.GroupedGEMMVariableKFlyDSLBackend
-    monkeypatch.setattr(backend, "MAX_G", patch.raised_max_groups(backend.MAX_G, G, True))
+    if not hasattr(backend, "MAX_G_GFX1250"):  # a Primus-Turbo that needs the patch
+        monkeypatch.setattr(backend, "MAX_G", patch.raised_max_groups(backend.MAX_G, G, True))
     monkeypatch.setenv("PRIMUS_TURBO_GROUPED_GEMM_BACKEND", "bf16:flydsl")
 
     gen = torch.Generator(device="cuda").manual_seed(0)

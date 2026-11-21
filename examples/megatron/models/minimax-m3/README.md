@@ -432,7 +432,8 @@ stopped at the first backward. Primus-Turbo's comment there gives 64 as a measur
 says the gfx1250 kernel was measured correct up to 160. The `megatron.turbo.flydsl_grouped_gemm_max_groups`
 patch (`primus/backends/megatron/patches/turbo/flydsl_grouped_gemm_patches.py`) raises the cap to the
 local expert count on gfx1250, up to 160, when the backend is FlyDSL. From EP2 on there are at most 64
-local experts and it changes nothing.
+local experts and it changes nothing. A Primus-Turbo that carries the gfx1250 cap itself
+(`GroupedGEMMVariableKFlyDSLBackend.MAX_G_GFX1250`) needs no patch, and the patch then does nothing.
 
 One MoE layer's fc1 (6144 to 6144) and fc2 (3072 to 6144), forward and backward, through
 `primus_turbo.pytorch.ops.grouped_gemm` with balanced routing; CUDA events, one GPU, twice each:
