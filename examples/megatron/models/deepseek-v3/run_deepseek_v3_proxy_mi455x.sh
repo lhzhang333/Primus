@@ -15,22 +15,15 @@
 ###############################################################################
 set -euo pipefail
 
-SCRIPT=$(realpath "$0")
-# relative to the caller's directory
-if [[ -n "${TURBO_DIR:-}" ]]; then
-    TURBO_DIR=$(realpath -e "${TURBO_DIR}")
-fi
-if [[ -n "${HIPBLASLT_TUNING_OVERRIDE_FILE:-}" ]]; then
-    HIPBLASLT_TUNING_OVERRIDE_FILE=$(realpath -e "${HIPBLASLT_TUNING_OVERRIDE_FILE}")
-fi
-cd "$(dirname "${SCRIPT}")/../../../.."
+# What the MI455X launch scripts share is in ../mi455x_launcher.sh: PRIMUS_LAUNCHER (container: re-run
+# this script in a new container of DOCKER_IMAGE; direct: run in this container), TURBO_DIR (a
+# Primus-Turbo checkout built in place for DOCKER_IMAGE, see README.md; empty: the image's
+# primus_turbo), HIPBLASLT_TUNING_OVERRIDE_FILE and PATCH_TRITON_EXPERT_SCHEDULING.
+# shellcheck source=examples/megatron/models/mi455x_launcher.sh
+source "$(dirname "$(realpath "$0")")/../mi455x_launcher.sh"
+mi455x_init
 
-# container: re-run this script in a new container of DOCKER_IMAGE; direct: run in this container
-export PRIMUS_LAUNCHER=${PRIMUS_LAUNCHER:-container}
-export DOCKER_IMAGE=${DOCKER_IMAGE:-amdprimus/amdprimus:tas-20261109}
 export EXP=${EXP:-examples/megatron/configs/MI455X/deepseek_v3-BF16-pretrain.yaml}
-# Primus-Turbo checkout built in place for DOCKER_IMAGE (see README.md); empty: the image's primus_turbo
-export TURBO_DIR=${TURBO_DIR:-}
 
 export GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-$(seq -s, 0 $((GPUS_PER_NODE - 1)))}
@@ -74,103 +67,27 @@ export PROFILE=${PROFILE:-False}
 export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-1}
 # 4 hardware queues per process, not base_env.sh's 2 (a little faster)
 export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-4}
-# 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
-# (runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh)
-export PATCH_TRITON_EXPERT_SCHEDULING=${PATCH_TRITON_EXPERT_SCHEDULING:-1}
-# hipBLASLt kernels tuned for this example's GEMMs (README.md); empty: hipBLASLt's own choice. hipBLASLt
-# uses a row only while its solution index still names the kernel it was tuned with. No default with
-# PRIMUS_HIPBLASLT_TUNING=1: its stage 3 would take this file instead of the stage-2 result.
-if [[ "${PRIMUS_HIPBLASLT_TUNING:-0}" == 1 ]]; then
-    export HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE-}
-else
-    export HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE-$(dirname "${SCRIPT}")/hipblaslt_tuning/deepseek_v3_proxy-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt}
-fi
-if [[ -n "${HIPBLASLT_TUNING_OVERRIDE_FILE}" && ! -r "${HIPBLASLT_TUNING_OVERRIDE_FILE}" ]]; then
-    echo "cannot read HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE}" >&2
-    exit 2
-fi
+# hipBLASLt kernels tuned for this example's GEMMs (README.md), unless HIPBLASLT_TUNING_OVERRIDE_FILE
+# names another file or is empty (hipBLASLt's own choice)
+mi455x_hipblaslt_tuning "$(dirname "${SCRIPT}")/hipblaslt_tuning/deepseek_v3_proxy-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt"
 
-export PRIMUS_TEAM=${PRIMUS_TEAM:-amd}
-export PRIMUS_USER=${PRIMUS_USER:-$(id -un)}
-export PRIMUS_EXP_NAME=${PRIMUS_EXP_NAME:-deepseek_v3_proxy_${GPUS_PER_NODE}gpu_$(date +%Y%m%d_%H%M%S)}
+mi455x_experiment "deepseek_v3_proxy_${GPUS_PER_NODE}gpu_$(date +%Y%m%d_%H%M%S)"
 
-case "${PRIMUS_LAUNCHER}" in
-    container)
-        # The settings above, plus the single-node variables `primus-cli container` passes through
-        ENV_ARGS=(-e PRIMUS_LAUNCHER=direct)
-        while IFS= read -r v; do
-            case "${v}" in
-                PRIMUS_LAUNCHER) ;;
-                EXP | TURBO_DIR | GPUS_PER_NODE | HIP_VISIBLE_DEVICES | TRAIN_ITERS | MBS | GBS | USE_TURBO_* | \
-                    TURBO_GROUPED_GEMM_BACKEND | MOCK_DATA | PROFILE | PATCH_TRITON_EXPERT_SCHEDULING | \
-                    MASTER_ADDR | MASTER_PORT | HF_TOKEN | WANDB_API_KEY | ENABLE_NUMA_BINDING | GPU_MAX_HW_QUEUES | \
-                    HSA_* | NVTE_* | PRIMUS_* | NCCL_* | RCCL_* | GLOO_* | IONIC_* | HIPBLASLT_*)
-                    ENV_ARGS+=(-e "${v}")
-                    ;;
-            esac
-        done < <(compgen -e)
-        DOCKER_ARGS=(--device /dev/kfd --device /dev/dri -v "${PWD}:${PWD}")
-        if [[ -e /dev/infiniband ]]; then
-            DOCKER_ARGS+=(--device /dev/infiniband)
-        fi
-        if [[ -n "${TURBO_DIR}" ]]; then
-            DOCKER_ARGS+=(-v "${TURBO_DIR}:${TURBO_DIR}")
-        fi
-        if [[ -n "${HIPBLASLT_TUNING_OVERRIDE_FILE}" ]]; then
-            DOCKER_ARGS+=(-v "${HIPBLASLT_TUNING_OVERRIDE_FILE}:${HIPBLASLT_TUNING_OVERRIDE_FILE}:ro")
-        fi
-        # Same runtime options as `primus-cli container` (runner/.primus.yaml)
-        exec docker run --rm --name "deepseek-v3-mi455x-$$" \
-            --ipc host --network host --privileged --group-add video \
-            --cap-add SYS_PTRACE --cap-add CAP_SYS_ADMIN --security-opt seccomp=unconfined \
-            --ulimit nofile=1048576:1048576 "${DOCKER_ARGS[@]}" -w "${PWD}" "${ENV_ARGS[@]}" \
-            "${DOCKER_IMAGE}" bash "${SCRIPT}" "$@"
-        ;;
-    direct) ;;
-    *)
-        echo "PRIMUS_LAUNCHER must be container or direct, not '${PRIMUS_LAUNCHER}'" >&2
-        exit 2
-        ;;
-esac
+# PRIMUS_LAUNCHER=container: re-run in a container with the settings above, plus the single-node
+# variables `primus-cli container` passes through
+mi455x_launch deepseek-v3-mi455x "${MI455X_FORWARD[@]}" TURBO_GROUPED_GEMM_BACKEND -- "$@"
 
-# Triton 3.8 turns on AMDGPU expert scheduling for gfx1250, which makes Triton kernels fault or
-# return NaN at random. TRITON_HIP_USE_EXPERT_SCHEDULING=0 (runner/helpers/envs/MI455X.sh, unless
-# the caller set it) turns it off when a kernel is compiled, but Inductor loads kernels from its
-# own cache without compiling them; changing Triton's default also invalidates that cache.
-# The patch script exits 2 when there is nothing to do and 1 when it cannot patch.
-bash runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh || [[ $? == 2 ]] || exit 2
-
-# True / False: whether the Primus-Turbo this run imports (TURBO_DIR, when set, else the image's) has
-# a feature; --where: its package directory
-turbo_has() {
-    PYTHONPATH="${TURBO_DIR:+${TURBO_DIR}:}${PYTHONPATH:-}" python3 -m primus.core.utils.turbo_capability "$@"
-}
+# Triton's gfx1250 expert scheduling off in the container's Triton, unless PATCH_TRITON_EXPERT_SCHEDULING=0
+mi455x_patch_triton
 
 # tas-20261019's primus_turbo predates the gfx1250 MegaMoE kernels
 if [[ "${USE_TURBO_MEGA_MOE}" == auto ]]; then
-    USE_TURBO_MEGA_MOE=$(turbo_has mega_moe.bf16)
-    echo "USE_TURBO_MEGA_MOE=auto: ${USE_TURBO_MEGA_MOE} (Primus-Turbo at $(turbo_has --where))"
+    USE_TURBO_MEGA_MOE=$(mi455x_turbo_has mega_moe.bf16)
+    echo "USE_TURBO_MEGA_MOE=auto: ${USE_TURBO_MEGA_MOE} (Primus-Turbo at $(mi455x_turbo_has --where))"
 fi
 
-# hipBLASLt takes a set but empty HIPBLASLT_TUNING_OVERRIDE_FILE as an override file named ""
-if [[ -z "${HIPBLASLT_TUNING_OVERRIDE_FILE}" ]]; then
-    unset HIPBLASLT_TUNING_OVERRIDE_FILE
-fi
-
-ENV_ARGS=(
-    --env PRIMUS_GPU_MODEL=MI455X
-    --env NNODES=1
-    --env GPUS_PER_NODE="${GPUS_PER_NODE}"
-    --env HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
-    --env PRIMUS_TURBO_ATTN_BACKEND="${PRIMUS_TURBO_ATTN_BACKEND}"
-)
-if [[ -n "${TURBO_DIR}" ]]; then
-    # --env is applied after Primus builds PYTHONPATH, so this checkout comes first.
-    ENV_ARGS+=(
-        --env "PYTHONPATH=${TURBO_DIR}:${TURBO_DIR}/build/pydeps:${PWD}:${PWD}/third_party/Megatron-LM"
-        --env PYTHONDONTWRITEBYTECODE=1
-    )
-fi
+# ENV_ARGS: the MI455X options of `primus-cli direct`, with TURBO_DIR first on PYTHONPATH when set
+mi455x_env_args PRIMUS_TURBO_ATTN_BACKEND="${PRIMUS_TURBO_ATTN_BACKEND}"
 
 # base_env.sh only exports ENABLE_NUMA_BINDING; primus-cli direct binds with --numa
 RUNNER_ARGS=()
@@ -185,8 +102,7 @@ else
     RECOMPUTE_ARGS=(--recompute_granularity null --recompute_layer_ids null)
 fi
 
-LOG_DIR="${PRIMUS_WORKSPACE:-output}/${PRIMUS_TEAM}/${PRIMUS_USER}/${PRIMUS_EXP_NAME}"
-mkdir -p "${LOG_DIR}"
+mi455x_log_dir
 ./primus-cli direct "${RUNNER_ARGS[@]}" "${ENV_ARGS[@]}" -- train pretrain --config "${EXP}" \
     --train_iters "${TRAIN_ITERS}" \
     --micro_batch_size "${MBS}" \
