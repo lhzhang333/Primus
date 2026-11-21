@@ -182,8 +182,8 @@ one run at a time, 2 runs; ms/iter is the average over iterations 3–10:
   `UnfusedDotProductAttention` (`USE_TURBO_ATTENTION=False`). The FlyDSL kernels take BF16 causal MHA
   with sequence lengths that are multiples of 64, fixed-length batches (no varlen) and a q tensor of at
   most 1 GiB (`MBS` <= 5 at seq 4096 with 128 heads per GPU); with the backend set to `flydsl`, any other
-  call raises `ValueError`. A Primus-Turbo without the FlyDSL MLA kernels
-  (`primus_turbo/flydsl/attention/gfx1250_mla/`, on `main` since 21588d59) raises that `ValueError` at the
+  call raises `ValueError`. A Primus-Turbo without the gfx1250 FlyDSL MLA kernels
+  (they are on its `main` since 21588d59) raises that `ValueError` at the
   first attention call; with such an image (e.g. `tas-20261011`) or `TURBO_DIR` checkout, set
   `PRIMUS_TURBO_ATTN_BACKEND=triton` or `USE_TURBO_ATTENTION=False`. Context parallelism (CP > 1) goes
   through Primus-Turbo's `flash_attn_usp_func`, which ignores `PRIMUS_TURBO_ATTN_BACKEND` and always uses

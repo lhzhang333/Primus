@@ -9,8 +9,8 @@ FlyDSL kernels and RMSNorm on Primus-Turbo. The config is
 the current container.
 
 The default image is `amdprimus/amdprimus:tas-20261109` (see the DeepSeek-V3 example's README). Its
-Primus-Turbo has the gfx1250 FlyDSL attention for head dim 128 (`primus_turbo/flydsl/attention/gfx1250/`,
-Primus-Turbo PR #574, on `main` since PR #580). The default before it, `amdprimus/amdprimus:tas-20261019`,
+Primus-Turbo has the gfx1250 FlyDSL attention for head dim 128
+(Primus-Turbo PR #574, on `main` since PR #580). The default before it, `amdprimus/amdprimus:tas-20261019`,
 has only the MLA one, so with that image this example needs a Primus-Turbo checkout that has it, passed as
 `TURBO_DIR` (see Another Primus-Turbo checkout below); the Reference tables were measured that way, with
 Primus-Turbo `dev/mi455x_v2` 85e85e70. With the backend left at `flydsl`, the launcher stops before training
@@ -156,7 +156,7 @@ Attention alone at this shape (b 4, seq 8192, 32/8 heads, causal; mean of 100 ca
   `flydsl`, any other call raises `ValueError`. The fused backward measured here needs causal attention,
   query lengths that are multiples of 64 and KV lengths that are multiples of 128; other calls use the
   deterministic two-kernel backward. With a
-  Primus-Turbo that lacks `primus_turbo/flydsl/attention/gfx1250/` (e.g. that of tas-20261019), every call
+  Primus-Turbo that lacks those kernels (e.g. that of tas-20261019), every call
   raises that `ValueError`. Primus-Turbo's Triton attention (`PRIMUS_TURBO_ATTN_BACKEND=triton`) needs
   Triton's expert scheduling off (see Triton expert scheduling above): with it on, the Triton attention
   forward made illegal memory accesses or gave NaN at this shape. `USE_TURBO_ATTENTION=False` runs TE's

@@ -59,7 +59,7 @@ Two runs at once on one node need different `MASTER_PORT`s.
 
 **FlyDSL attention for the dense layers.** The launcher runs the three dense layers on Primus-Turbo's
 FlyDSL attention when the Primus-Turbo in use has its gfx1250 kernels for head dim 128
-(`primus_turbo/flydsl/attention/gfx1250/`, Primus-Turbo PR #580). The default image's Primus-Turbo
+(Primus-Turbo PR #580). The default image's Primus-Turbo
 has them. That of `DOCKER_IMAGE=amdprimus/amdprimus:tas-20261019` predates them; to use them with that
 image, build a Primus-Turbo checkout in place for it once (gfx1250 only, OpenMPI off the paths so
 rocSHMEM is not linked) and pass it as `TURBO_DIR`; the launcher puts it first on `PYTHONPATH`:
@@ -101,8 +101,9 @@ has; with a FlyDSL that lacks them, building an MSA layer stops with an `ImportE
   the image, see above. A relative path is taken from the current directory.
 - Dense layers: `USE_TURBO_ATTENTION` runs Primus-Turbo attention in the three dense layers, with
   `PRIMUS_TURBO_ATTN_BACKEND`, `flydsl` or `triton`. They default to `True` and `flydsl` when the
-  Primus-Turbo in use (`TURBO_DIR`, else the image's) has `primus_turbo/flydsl/attention/gfx1250/`,
-  as the default image's does, and to `False` and `triton` otherwise. Asking for `flydsl` without
+  Primus-Turbo in use (`TURBO_DIR`, else the image's) has the gfx1250 FlyDSL attention kernels for
+  head dim 128 (`attention.flydsl.mha` in `primus_turbo.capabilities`; a Primus-Turbo that predates
+  that module is asked the old way), as the default image's does, and to `False` and `triton` otherwise. Asking for `flydsl` without
   those kernels stops the launcher before training. Primus-Turbo's own default backend fails with
   `invalid argument for fmha_bwd` here. MSA layers are unaffected.
 - Optimizer: the MI455X configs keep BF16 gradients and Adam moments
