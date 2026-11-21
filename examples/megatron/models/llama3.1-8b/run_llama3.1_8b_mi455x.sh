@@ -56,6 +56,8 @@ case "${PRIMUS_TURBO_ATTN_BACKEND,,}" in
         exit 2
         ;;
 esac
+# 1: the fused QKV RoPE of the config runs on Primus-Turbo's FlyDSL kernels; 0: on TE's
+export PRIMUS_TURBO_FLYDSL_ROPE=${PRIMUS_TURBO_FLYDSL_ROPE:-1}
 export MOCK_DATA=${MOCK_DATA:-True}
 export PROFILE=${PROFILE:-False}
 # 1: switch Triton's gfx1250 expert scheduling off in the container's Triton (needs root), see below
@@ -162,6 +164,7 @@ ENV_ARGS=(
     --env HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
     --env TRITON_HIP_USE_EXPERT_SCHEDULING=0
     --env PRIMUS_TURBO_ATTN_BACKEND="${PRIMUS_TURBO_ATTN_BACKEND}"
+    --env PRIMUS_TURBO_FLYDSL_ROPE="${PRIMUS_TURBO_FLYDSL_ROPE}"
     --env HSA_COREDUMP_PATTERN=/dev/null
 )
 if [[ -n "${TURBO_DIR}" ]]; then
