@@ -6,6 +6,7 @@
 Use the `hipblaslt-bench` tool to perform GEMM tuning.
 
 `hipblaslt-bench` is usually located under `/opt/rocm/bin`. However, if it's not available in some environments/docker, you'll need to reinstall hipblaslt.
+On an image that ships ROCm as TheRock Python wheels, `hipblaslt_bench/CMakeLists.txt` builds only the bench against the installed hipBLASLt (steps: `examples/megatron/models/gpt-oss/README.md`, "Building hipblaslt-bench").
 
 
 ### Install Hipblaslt (Optional)

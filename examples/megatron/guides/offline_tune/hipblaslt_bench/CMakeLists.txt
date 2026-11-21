@@ -1,6 +1,7 @@
 # Builds only hipblaslt-bench from the hipBLASLt sources, against the hipBLASLt already installed
 # in the image (TheRock rocm-sdk wheels), so the bench enumerates the same kernel library and
-# solution indices as training. Build steps: ../../README.md, "Building hipblaslt-bench".
+# solution indices as training. Build steps: examples/megatron/models/gpt-oss/README.md,
+# "Building hipblaslt-bench".
 cmake_minimum_required(VERSION 3.25)
 project(hipblaslt_bench_standalone LANGUAGES CXX Fortran)
 
