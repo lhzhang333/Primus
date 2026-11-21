@@ -135,6 +135,7 @@ from primus.backends.megatron.core.extensions._triton.inplace_add import (
 )
 from primus.core.utils.gpu_arch import is_gfx1250
 from primus.core.utils.module_utils import warning_rank_0
+from primus.core.utils.turbo_capability import turbo_has
 
 _dummy_wgrads = {}
 
@@ -305,13 +306,7 @@ def _flydsl_bf16_wgrad_can_accumulate(main_grad: Optional[torch.Tensor]) -> bool
         return False
     if main_grad.dim() < 2 or main_grad.shape[-2] % 256 or main_grad.shape[-1] % 256:
         return False
-    try:
-        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (  # noqa: F401
-            grouped_gemm_bf16_variable_k_accum_supported,
-        )
-    except ImportError:
-        return False
-    return True
+    return turbo_has("grouped_gemm.flydsl.bf16.wgrad_accum", "gfx1250")
 
 
 def _grouped_wgrad_accum_fusion(config) -> bool:

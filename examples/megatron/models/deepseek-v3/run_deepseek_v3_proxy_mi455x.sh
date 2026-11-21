@@ -150,15 +150,16 @@ if [[ "${PATCH_TRITON_EXPERT_SCHEDULING}" == 1 ]]; then
     fi
 fi
 
-# tas-20261019's primus_turbo predates the gfx1250 MegaMoE kernels; TURBO_DIR, when set, is the one in use
+# True / False: whether the Primus-Turbo this run imports (TURBO_DIR, when set, else the image's) has
+# a feature; --where: its package directory
+turbo_has() {
+    PYTHONPATH="${TURBO_DIR:+${TURBO_DIR}:}${PYTHONPATH:-}" python3 -m primus.core.utils.turbo_capability "$@"
+}
+
+# tas-20261019's primus_turbo predates the gfx1250 MegaMoE kernels
 if [[ "${USE_TURBO_MEGA_MOE}" == auto ]]; then
-    TURBO_PKG=$(PYTHONPATH="${TURBO_DIR:+${TURBO_DIR}:}${PYTHONPATH:-}" python3 -c \
-        'import importlib.util; print(importlib.util.find_spec("primus_turbo").submodule_search_locations[0])')
-    USE_TURBO_MEGA_MOE=False
-    if [[ -d "${TURBO_PKG}/flydsl/mega/gfx1250" ]]; then
-        USE_TURBO_MEGA_MOE=True
-    fi
-    echo "USE_TURBO_MEGA_MOE=auto: ${USE_TURBO_MEGA_MOE} (Primus-Turbo at ${TURBO_PKG})"
+    USE_TURBO_MEGA_MOE=$(turbo_has mega_moe.bf16)
+    echo "USE_TURBO_MEGA_MOE=auto: ${USE_TURBO_MEGA_MOE} (Primus-Turbo at $(turbo_has --where))"
 fi
 
 # hipBLASLt takes a set but empty HIPBLASLT_TUNING_OVERRIDE_FILE as an override file named ""
