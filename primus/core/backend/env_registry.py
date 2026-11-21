@@ -57,6 +57,7 @@ from typing import Callable, Iterable, List, Optional
 ARCH_ALL = "all"
 ARCH_GFX950 = "gfx950"  # MI350X / MI355X
 ARCH_GFX942 = "gfx942"  # MI300X / MI325X
+ARCH_GFX1250 = "gfx1250"  # MI455X
 
 # Application modes.
 MODE_SETDEFAULT = "setdefault"  # os.environ.setdefault (respect anything already set)
@@ -89,7 +90,7 @@ class EnvVar:
     Args:
         name: Environment variable name.
         value: Desired value (string).
-        arch: Arch gate — ``"all"`` (default), ``"gfx950"``, or ``"gfx942"``.
+        arch: Arch gate — ``"all"`` (default), ``"gfx950"``, ``"gfx942"``, or ``"gfx1250"``.
         mode: ``"setdefault"`` (default) or ``"xla_append"`` (for ``XLA_FLAGS``).
         note: Optional human-readable rationale (for logs / maintainers).
     """
@@ -107,7 +108,7 @@ _ARCH_CACHE: Optional[str] = None
 def detect_gpu_arch() -> str:
     """Best-effort GPU arch detection via ``rocminfo``.
 
-    Returns ``"gfx950"``, ``"gfx942"``, or ``"unknown"``. Result is cached for the
+    Returns ``"gfx950"``, ``"gfx942"``, ``"gfx1250"``, or ``"unknown"``. Result is cached for the
     process. Never raises — detection must never abort a training run.
     """
     global _ARCH_CACHE
@@ -118,7 +119,7 @@ def detect_gpu_arch() -> str:
     rocminfo = shutil.which("rocminfo") or "/opt/rocm/bin/rocminfo"
     try:
         out = subprocess.run([rocminfo], capture_output=True, text=True, timeout=15).stdout
-        for cand in (ARCH_GFX950, ARCH_GFX942):
+        for cand in (ARCH_GFX950, ARCH_GFX942, ARCH_GFX1250):
             if cand in out:
                 arch = cand
                 break

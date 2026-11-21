@@ -17,10 +17,14 @@ cannot use plain ``setdefault`` semantics:
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from primus.core.backend import env_registry
 from primus.core.backend.env_registry import (
+    ARCH_GFX950,
+    ARCH_GFX1250,
     MODE_XLA_APPEND,
     XLA_FLAGS_APPEND,
     EnvVar,
@@ -217,3 +221,48 @@ def test_setdefault_entry_fills_when_unset(monkeypatch):
 
 def test_empty_entries_is_noop():
     assert apply_env_defaults([], "megatron") == []
+
+
+# ------------------------------ architecture gate -----------------------------
+
+
+def _rocminfo(monkeypatch, output):
+    """Make rocminfo print ``output`` for a fresh detection."""
+    monkeypatch.setattr(env_registry, "_ARCH_CACHE", None)
+    monkeypatch.setattr(
+        env_registry.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=output)
+    )
+
+
+@pytest.mark.parametrize(
+    ("output", "arch"),
+    [
+        ("  Name:                    gfx950\n", "gfx950"),
+        ("  Name:                    gfx942\n", "gfx942"),
+        ("  Name:                    gfx1250\n", "gfx1250"),
+        ("  Name:                    gfx1100\n", "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_detect_gpu_arch(monkeypatch, output, arch):
+    _rocminfo(monkeypatch, output)
+    assert env_registry.detect_gpu_arch() == arch
+
+
+def test_gfx1250_takes_its_own_entries_and_none_of_another_arch(monkeypatch):
+    _rocminfo(monkeypatch, "  Name:                    gfx1250\n")
+    for name in ("ENV_REGISTRY_TEST_GFX950", "ENV_REGISTRY_TEST_GFX1250", "ENV_REGISTRY_TEST_ALL"):
+        monkeypatch.delenv(name, raising=False)
+
+    applied = apply_env_defaults(
+        [
+            EnvVar("ENV_REGISTRY_TEST_GFX950", "1", arch=ARCH_GFX950),
+            EnvVar("ENV_REGISTRY_TEST_GFX1250", "1", arch=ARCH_GFX1250),
+            EnvVar("ENV_REGISTRY_TEST_ALL", "1"),
+        ],
+        "megatron",
+    )
+
+    assert applied == ["ENV_REGISTRY_TEST_GFX1250", "ENV_REGISTRY_TEST_ALL"]
+    for name in applied:
+        monkeypatch.delenv(name)
