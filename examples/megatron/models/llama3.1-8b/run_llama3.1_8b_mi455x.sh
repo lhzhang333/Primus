@@ -116,16 +116,19 @@ case "${PRIMUS_LAUNCHER}" in
         ;;
 esac
 
+# True / False: whether the Primus-Turbo this run imports (TURBO_DIR, when set, else the image's) has
+# a feature; --where: its package directory
+turbo_has() {
+    PYTHONPATH="${TURBO_DIR:+${TURBO_DIR}:}${PYTHONPATH:-}" python3 -m primus.core.utils.turbo_capability "$@"
+}
+
 # The flydsl backend needs Primus-Turbo's gfx1250 head-dim-128 kernels (README.md). Without them the
 # first attention call raises ValueError, after the model and optimizer are built; stop here instead.
 if [[ "${USE_TURBO_ATTENTION,,}" =~ ^(true|1|yes)$ && "${PRIMUS_TURBO_ATTN_BACKEND,,}" == flydsl ]]; then
-    if [[ -n "${TURBO_DIR}" ]]; then
-        TURBO_PKG=${TURBO_DIR}/primus_turbo
-    else
-        TURBO_PKG=$(python3 -c 'import importlib.util, os; s = importlib.util.find_spec("primus_turbo"); print(os.path.dirname(s.origin) if s and s.origin else "")')
-    fi
-    if [[ ! -d "${TURBO_PKG}/flydsl/attention/gfx1250" ]]; then
-        echo "PRIMUS_TURBO_ATTN_BACKEND=flydsl needs a Primus-Turbo with primus_turbo/flydsl/attention/gfx1250/," \
+    HAS_FLYDSL_ATTENTION=$(turbo_has attention.flydsl.mha)
+    if [[ "${HAS_FLYDSL_ATTENTION}" != True ]]; then
+        TURBO_PKG=$(turbo_has --where)
+        echo "PRIMUS_TURBO_ATTN_BACKEND=flydsl needs a Primus-Turbo with the gfx1250 FlyDSL attention kernels," \
             "which ${TURBO_PKG:-this Python environment} lacks. Set TURBO_DIR to such a checkout (README.md)" \
             "or PRIMUS_TURBO_ATTN_BACKEND=triton." >&2
         exit 2
