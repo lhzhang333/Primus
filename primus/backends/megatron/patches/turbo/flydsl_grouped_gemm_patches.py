@@ -15,6 +15,9 @@ GPU has 128).
 
 On gfx1250 this raises the cap to the local expert count, up to 160. Nothing changes on
 other architectures, with at most 64 local experts, or above 160.
+
+A Primus-Turbo whose backend has ``MAX_G_GFX1250`` carries the gfx1250 cap itself and needs no
+patch: this one then does nothing. It stays for the Primus-Turbo builds that predate that.
 """
 
 from typing import Optional
@@ -65,6 +68,10 @@ def patch_flydsl_grouped_gemm_max_groups(ctx: PatchContext):
     cap = getattr(backend, "MAX_G", None)
     if cap is None:
         log_rank_0(f"{tag} this Primus-Turbo has no FlyDSL variable-K expert cap, skipped")
+        return
+    own_cap = getattr(backend, "MAX_G_GFX1250", None)
+    if own_cap is not None:
+        log_rank_0(f"{tag} this Primus-Turbo has its own gfx1250 expert cap ({own_cap}), skipped")
         return
     n = local_experts(get_args(ctx))
     new_cap = raised_max_groups(cap, n, is_gfx1250())
