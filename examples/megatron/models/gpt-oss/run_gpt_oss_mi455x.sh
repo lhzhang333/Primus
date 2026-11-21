@@ -21,6 +21,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${HERE}/../../../.." && pwd)"
 cd "${REPO}"
+# the container re-run and the Triton patch are common to the MI455X launch scripts
+# shellcheck source=examples/megatron/models/mi455x_launcher.sh
+source "${HERE}/../mi455x_launcher.sh"
 
 export MODEL=${MODEL:-20B}
 export DOCKER_IMAGE=${DOCKER_IMAGE:-amdprimus/amdprimus:tas-20261019}
@@ -29,23 +32,13 @@ export PRIMUS_TEAM=${PRIMUS_TEAM:-amd}
 export PRIMUS_USER=${PRIMUS_USER:-$(whoami)}
 
 if [ "${PRIMUS_LAUNCHER}" = "container" ]; then
-  ENV_ARGS=()
-  for v in MODEL PRIMUS_TEAM PRIMUS_USER PRIMUS_EXP_NAME PRIMUS_EP HIP_VISIBLE_DEVICES GPUS_PER_NODE \
-           TRAIN_ITERS MBS GBS NUM_LAYERS CE_IMPL EXTRA_ARGS PATCH_TRITON_EXPERT_SCHEDULING \
-           TRITON_HIP_USE_EXPERT_SCHEDULING PRIMUS_TURBO_ATTN_BACKEND HSA_COREDUMP_PATTERN HF_TOKEN \
-           HIPBLASLT_TUNING_OVERRIDE_FILE; do
-    if [ -n "${!v+x}" ]; then ENV_ARGS+=(-e "${v}"); fi
-  done
-  DEVICE_ARGS=(--device /dev/kfd --device /dev/dri)
-  if [ -e /dev/infiniband ]; then DEVICE_ARGS+=(--device /dev/infiniband); fi
   echo "[gpt-oss] launching ${MODEL} in ${DOCKER_IMAGE}"
-  # Same runtime options as `primus-cli container` (runner/.primus.yaml).
-  exec docker run --rm --name "gpt-oss-mi455x-$$" \
-    --ipc host --network host --privileged --group-add video \
-    --cap-add SYS_PTRACE --cap-add CAP_SYS_ADMIN --security-opt seccomp=unconfined \
-    --ulimit nofile=1048576:1048576 "${DEVICE_ARGS[@]}" \
-    -v "${REPO}:${REPO}" -w "${REPO}" "${ENV_ARGS[@]}" -e PRIMUS_LAUNCHER=direct \
-    "${DOCKER_IMAGE}" bash "${HERE}/$(basename "${BASH_SOURCE[0]}")"
+  SCRIPT="${HERE}/$(basename "${BASH_SOURCE[0]}")"
+  # re-runs this script in the container with the variables named here; does not return
+  mi455x_launch gpt-oss-mi455x MODEL PRIMUS_TEAM PRIMUS_USER PRIMUS_EXP_NAME PRIMUS_EP HIP_VISIBLE_DEVICES \
+    GPUS_PER_NODE TRAIN_ITERS MBS GBS NUM_LAYERS CE_IMPL EXTRA_ARGS PATCH_TRITON_EXPERT_SCHEDULING \
+    TRITON_HIP_USE_EXPERT_SCHEDULING PRIMUS_TURBO_ATTN_BACKEND HSA_COREDUMP_PATTERN HF_TOKEN \
+    HIPBLASLT_TUNING_OVERRIDE_FILE --
 fi
 
 ########################## gfx1250 runtime settings ##########################
@@ -62,8 +55,7 @@ export PRIMUS_TURBO_ATTN_BACKEND=${PRIMUS_TURBO_ATTN_BACKEND:-triton}
 export HIPBLASLT_TUNING_OVERRIDE_FILE=${HIPBLASLT_TUNING_OVERRIDE_FILE-${HERE}/hipblaslt_tuning/gpt_oss-gfx1250-hipblaslt_e1e7fdcab9-rocm_10.2.0a20261011.txt}
 [ -n "${HIPBLASLT_TUNING_OVERRIDE_FILE}" ] || unset HIPBLASLT_TUNING_OVERRIDE_FILE
 
-# The patch script exits 2 when there is nothing to do and 1 when it cannot patch (not root).
-bash runner/helpers/patches/13_triton_gfx1250_expert_scheduling.sh || [[ $? == 2 ]] || exit 2
+mi455x_patch_triton
 
 ################################ Parallelism #################################
 export NNODES=1
